@@ -17,16 +17,16 @@ func TestBasic(*testing.T) {
 func TestIntermediate(*testing.T) {
   cf, _ := Make(64)
   var result bool
-  for i := 0; i < 200; i++ {
-    s := "test" + strconv.Itoa(i)
+  for i := 0; i < 250; i++ {
+    s := strconv.Itoa(i)
     result = cf.Add(s)
     if !result {
       fmt.Println("Add failed. This isn't good.", s)
       break
     }
   }
-  for j := 0; j < 200; j++ {
-    s := "test" + strconv.Itoa(j)
+  for j := 0; j < 250; j++ {
+    s := strconv.Itoa(j)
     result = cf.Contains(s)
     if !result {
       fmt.Println("Contains failed. This is bad. ", s)
