@@ -17,7 +17,7 @@ func TestBasic(*testing.T) {
 func TestIntermediate(*testing.T) {
   cf, _ := Make(64)
   var result bool
-  for i := 0; i < 240; i++ {
+  for i := 0; i < 250; i++ {
     s := "test" + strconv.Itoa(i)
     result = cf.Add(s)
     if !result {
