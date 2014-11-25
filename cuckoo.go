@@ -4,7 +4,7 @@ import (
   "errors"
   // "strings"
   // "fmt"
-  "crypto/sha1"
+  "crypto/sha256"
   "math/rand"
   "fmt"
   "math/big"
@@ -28,9 +28,9 @@ type bucketList struct {
 
 /****** General Utilities *******/
 
-// Takes in a string and returns an 8-byte (64-bit) hash value. The 8-bytes are the first 8-bytes of a 20-byte SHA1- checksum.
+// Takes in a string and returns an 32-byte (64-bit) hash value. Using SHA-256.
 func hash(s string) []byte {
-  longchecksum := sha1.Sum([]byte(s))
+  longchecksum := sha256.Sum256([]byte(s))
   return longchecksum[0:]
 }
 // Choose one of firstIndex and secondIndex randomly.
@@ -44,21 +44,37 @@ func choose(firstIndex, secondIndex uint64) uint64 {
 
 // Given two byte arrays, returns a new XORed byte array 
 func xor(a, b []byte) []byte {
-  result := make([]byte, len(a))
-  for i := 0; i < len(a); i++ {
+  // fmt.Println("Length of XOR arrays are: ", len(a), " and " ,len(b))
+  var min int
+  if len(a) < len(b) {
+    min = len(a)
+  } else {
+    min = len(b)
+  }
+  result := make([]byte, min)
+  for i := 0; i < min; i++ {
     result[i] = a[i] ^ b[i]
   }
   return result
 }
 
+func xorAllBytes(a []byte) byte {
+  var result byte
+  result = a[0]
+  for i := 0; i < len(a); i++ {
+    result = result ^ a[i]
+  }
+  return result
+}
 /**** To instantiate a new cuckoo filter, call this *****/
 func Make(size int) (*CuckooFilter, error) {
   if size <= 0 {
     return nil, errors.New("Specify a positive size.")
   }
+  // fmt.Println("Size is", size)
   cf := &CuckooFilter { 
-    size: size/BUCKET_SIZE, 
-    hashtable: make([]bucketList, size/BUCKET_SIZE)}
+    size: size, 
+    hashtable: make([]bucketList, size)}
   return cf, nil
 }
 
@@ -78,7 +94,7 @@ func (cf *CuckooFilter) insert(index uint64, fingerprint byte) bool {
 
 // This function is responsible for the chained displacements of fingerprints. Forces an insert of fingerprint and the relevant index, and then chains displace for the evicted fingerprint. Returns false ('too full') in case number of displacements is over MAX_DISPLACEMENTS
 func (cf *CuckooFilter) displace(fingerprint byte, index uint64) bool {
-  // fmt.Println("In displace...")
+  fmt.Println("In displace...")
   var displacements int = 1
   firstIndex, intermediateXor, newIndex, cuckooSize := big.NewInt(int64(index)), new(big.Int), new(big.Int), big.NewInt(int64(cf.size))
   for displacements < MAX_DISPLACEMENTS {
@@ -111,7 +127,7 @@ func (cf *CuckooFilter) calculateIndices(checksum []byte, fingerprint byte) (uin
 
   _ = checksumNumber.SetBytes(checksum)
   _ = firstIndex.Mod(checksumNumber, cuckooSize)
-  
+  // fmt.Println(firstIndex.Bytes())
   intermediateXor.SetBytes(xor(firstIndex.Bytes(), hash(string(fingerprint))))
   secondIndex.Mod(intermediateXor, cuckooSize)
 
@@ -121,7 +137,7 @@ func (cf *CuckooFilter) calculateIndices(checksum []byte, fingerprint byte) (uin
 // This function returns a triplet: true or false if the key/fingerprint is in the filter, the bucket index and the index of the fingerprint within the bucket.
 func (cf *CuckooFilter) contains(key string) (bool, uint64, int) {
   checksum := hash(key)
-  fingerprint := checksum[0]
+  fingerprint := xorAllBytes(checksum)
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
   // fmt.Println("In contains. First and second indices are: ", firstIndex, secondIndex)
   fingerprintIndex, present := cf.search(firstIndex, fingerprint)
@@ -161,9 +177,13 @@ func (cf *CuckooFilter) deleteEntry(bucketIndex uint64, entryIndex int) {
 func (cf *CuckooFilter) Add(key string) bool {
   // TODO: Initialize random generator
   // 8-byte SHA checksum of the key
+  if cf.Contains(key) {
+    fmt.Println("Returning...")
+    return false
+  }
   checksum := hash(key)
   // Calculate the fingerprint: pick highest byte from the checksum
-  fingerprint := checksum[0]
+  fingerprint := xorAllBytes(checksum)
   // find indices of the fingerprint in the filter
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
   // fmt.Println("In add. First index and second index are ", firstIndex, secondIndex)
