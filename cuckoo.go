@@ -4,11 +4,10 @@ import (
   "errors"
   // "strings"
   // "fmt"
-  "math"
   "crypto/sha1"
-  "encoding/binary"
   "math/rand"
   "fmt"
+  "math/big"
   // "time"
 )
 // Constants
@@ -32,7 +31,7 @@ type bucketList struct {
 // Takes in a string and returns an 8-byte (64-bit) hash value. The 8-bytes are the first 8-bytes of a 20-byte SHA1- checksum.
 func hash(s string) []byte {
   longchecksum := sha1.Sum([]byte(s))
-  return longchecksum[0:2*BUCKET_SIZE]
+  return longchecksum[0:]
 }
 // Choose one of firstIndex and secondIndex randomly.
 func choose(firstIndex, secondIndex uint64) uint64 {
@@ -42,12 +41,7 @@ func choose(firstIndex, secondIndex uint64) uint64 {
   }
   return secondIndex
 }
-// Converts the given 64-bit integer to an 8-byte array.
-func toBytes(num uint64) []byte {
-  byteArray := make([]byte, 8)
-  _ = binary.PutUvarint(byteArray, num)
-  return byteArray
-}
+
 // Given two byte arrays, returns a new XORed byte array 
 func xor(a, b []byte) []byte {
   result := make([]byte, len(a))
@@ -76,7 +70,7 @@ func (cf *CuckooFilter) insert(index uint64, fingerprint byte) bool {
   if bucket.numElements < BUCKET_SIZE {
     bucket.fingerprints[bucket.numElements] = fingerprint
     bucket.numElements++
-    fmt.Println("Number of elements in the bucket is:", bucket.numElements)
+    // fmt.Println("Number of elements in the bucket is:", bucket.numElements)
     return true
   }
   return false
@@ -84,35 +78,44 @@ func (cf *CuckooFilter) insert(index uint64, fingerprint byte) bool {
 
 // This function is responsible for the chained displacements of fingerprints. Forces an insert of fingerprint and the relevant index, and then chains displace for the evicted fingerprint. Returns false ('too full') in case number of displacements is over MAX_DISPLACEMENTS
 func (cf *CuckooFilter) displace(fingerprint byte, index uint64) bool {
+  // fmt.Println("In displace...")
   var displacements int = 1
+  firstIndex, intermediateXor, newIndex, cuckooSize := big.NewInt(int64(index)), new(big.Int), new(big.Int), big.NewInt(int64(cf.size))
   for displacements < MAX_DISPLACEMENTS {
     if cf.insert(index, fingerprint) {
       return true
     }
     currBucket := cf.hashtable[index]
     displaceIndex := rand.Intn(BUCKET_SIZE)
+
     // Swap out the old fingerprint
     oldFingerprint := currBucket.fingerprints[displaceIndex]
     currBucket.fingerprints[displaceIndex] = fingerprint
 
     // Calculate secondary index of the old fingerprint
-    intermediateXor, _ := binary.Uvarint(xor(toBytes(index), hash(string(oldFingerprint))))
-    newIndex := uint64(math.Mod(float64(intermediateXor), float64(cf.size)))
-
+    _ = firstIndex.SetInt64(int64(index))
+    intermediateXor.SetBytes(xor(firstIndex.Bytes(), hash(string(fingerprint))))
+    newIndex.Mod(intermediateXor, cuckooSize)
     // Apply displace on the old fingerprint
-    index = newIndex
+    index = newIndex.Uint64()
     fingerprint = oldFingerprint
+    displacements++
   }
   return false
 }
 
 // This function calculates the relevant first and second bucket indices of the fingerprint.
 func (cf *CuckooFilter) calculateIndices(checksum []byte, fingerprint byte) (uint64, uint64) {
-  num, _ := binary.Uvarint(checksum)
-  index := uint64(math.Mod(float64(num), float64(cf.size)))
-  intermediateXor, _ := binary.Uvarint(xor(toBytes(index),hash(string(fingerprint))))
-  secondaryIndex := uint64(math.Mod(float64(intermediateXor), float64(cf.size)))
-  return index, secondaryIndex
+  checksumNumber, firstIndex, secondIndex, intermediateXor := new(big.Int), new(big.Int), new(big.Int), new(big.Int)
+  cuckooSize := big.NewInt(int64(cf.size))
+
+  _ = checksumNumber.SetBytes(checksum)
+  _ = firstIndex.Mod(checksumNumber, cuckooSize)
+  
+  intermediateXor.SetBytes(xor(firstIndex.Bytes(), hash(string(fingerprint))))
+  secondIndex.Mod(intermediateXor, cuckooSize)
+
+  return firstIndex.Uint64(), secondIndex.Uint64()
 }
 
 // This function returns a triplet: true or false if the key/fingerprint is in the filter, the bucket index and the index of the fingerprint within the bucket.
@@ -120,7 +123,7 @@ func (cf *CuckooFilter) contains(key string) (bool, uint64, int) {
   checksum := hash(key)
   fingerprint := checksum[0]
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
-  fmt.Println("In contains. First and second indices are: ", firstIndex, secondIndex)
+  // fmt.Println("In contains. First and second indices are: ", firstIndex, secondIndex)
   fingerprintIndex, present := cf.search(firstIndex, fingerprint)
   if present {
     return true, firstIndex, fingerprintIndex
@@ -136,7 +139,7 @@ func (cf *CuckooFilter) contains(key string) (bool, uint64, int) {
 // Search bucket for fingerprint. Returns (index, present). If not found, present is false
 func (cf *CuckooFilter) search(index uint64, fingerprint byte) (int, bool){
   currBucket := &cf.hashtable[index]
-  fmt.Println("In search. Number of elements is... ", currBucket.numElements)
+  // fmt.Println("In search. Number of elements is... ", currBucket.numElements)
   i := uint8(0)
   for i = 0; i < currBucket.numElements; i++ {
     if currBucket.fingerprints[i] == fingerprint {
@@ -163,11 +166,11 @@ func (cf *CuckooFilter) Add(key string) bool {
   fingerprint := checksum[0]
   // find indices of the fingerprint in the filter
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
-  fmt.Println("In add. First index and second index are ", firstIndex, secondIndex)
+  // fmt.Println("In add. First index and second index are ", firstIndex, secondIndex)
   // Try to insert at first index
   tryFirst := cf.insert(firstIndex, fingerprint)
   if !tryFirst {
-    fmt.Println("I'm here..")
+    // fmt.Println("I'm here..")
     // try at second
     trySecond := cf.insert(secondIndex, fingerprint)
     if !trySecond {
@@ -178,7 +181,7 @@ func (cf *CuckooFilter) Add(key string) bool {
     }
     return true
   }
-  fmt.Println("Finishing add. Number of elements is now: ", cf.hashtable[0].numElements)
+  // fmt.Println("Finishing add. Number of elements is now: ", cf.hashtable[0].numElements)
   return true
 }
 
