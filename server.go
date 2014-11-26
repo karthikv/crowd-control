@@ -19,10 +19,14 @@ const (
   HEARTBEAT_TIMEOUT = 25 * time.Millisecond
 
   SERVER_RPC_RETRIES = 3
+  OP_LOG_ENTRIES = 256
 )
 
 
 // TODO: add random seed later
+// TODO: handle eviction
+
+
 /* Represents a single CrowdControl peer that maintains consensus over a set of
  * key -> value pairs. */
 type CrowdControl struct {
@@ -52,7 +56,7 @@ type CrowdControl struct {
   cache map[string]string
 
   // whether the data for a given key on a given peer is invalid
-  invalid []map[string]bool
+  filter []map[string]bool
 }
 
 
@@ -262,7 +266,25 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
+  if cc.primary != cc.me {
+    // only the primary can handle set requests
+    // TODO: should probably send back who the real primary is
+    return nil
+  }
+
+  value, exists := cc.cache[args.Key]
+  if exists && value == args.Value {
+    // already set this value (set likely in progress from earlier)
+    return nil
+  }
+
   cc.cache[args.Key] = args.Value
+  for i, _ := range cc.peers {
+    cc.filter[i][args.Key] = true
+  }
+
+
+
   return nil
 }
 
@@ -290,7 +312,11 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.scheduleHeartbeat()
 
   cc.cache = make(map[string]string)
-  cc.invalid = make([]map[string]bool, cc.numPeers)
+  cc.filter = make([]map[string]bool, cc.numPeers)
+
+  for i := 0; i < cc.numPeers; i++ {
+    cc.filter[i] = make(map[string]bool)
+  }
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)

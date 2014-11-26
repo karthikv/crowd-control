@@ -107,6 +107,8 @@ func TestGetSetSingle(testing *testing.T) {
   var client Client
   client.Init(peers)
 
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
   ok := client.Set("foo", "bar")
   if !ok {
     testing.Fatal("Set foo -> bar failed\n")
