@@ -40,6 +40,7 @@ type CrowdControl struct {
 
   // views to disambiguate the primary, as in VR
   view int
+  nextView int  // the next view number upon election timeout
   primary int
 
   // leader election
@@ -67,7 +68,7 @@ func (cc *CrowdControl) scheduleHeartbeat() {
         }
 
         if cc.primary == cc.me {
-          cc.sendHeartbeat()
+          cc.sendHeartbeat_ml()
         }
         cc.mutex.Unlock()
       }
@@ -76,7 +77,7 @@ func (cc *CrowdControl) scheduleHeartbeat() {
 }
 
 
-func (cc *CrowdControl) sendHeartbeat() {
+func (cc *CrowdControl) sendHeartbeat_ml() {
   log.Printf("CC[%v] sending heartbeats\n", cc.me)
   args := &HeartbeatArgs{Primary: cc.primary, View: cc.view}
 
@@ -100,15 +101,10 @@ func (cc *CrowdControl) Heartbeat(args *HeartbeatArgs, response *HeartbeatRespon
   defer cc.mutex.Unlock()
 
   if cc.view < args.View {
-    cc.view = args.View
-    cc.primary = args.Primary
+    cc.setView_ml(args.View, args.Primary)
   }
 
   if cc.view == args.View {
-    if cc.primary == -1 {
-      cc.primary = args.Primary
-    }
-
     if cc.primary != args.Primary {
       log.Fatalf("CC[%v] fatal primaries don't match %v and %v\n", cc.me,
         cc.primary, args.Primary)
@@ -139,7 +135,7 @@ func (cc *CrowdControl) scheduleElection() {
         }
 
         if cc.primary != cc.me {
-          cc.attemptElection()
+          cc.attemptElection_ml()
         }
         cc.mutex.Unlock()
 
@@ -151,10 +147,10 @@ func (cc *CrowdControl) scheduleElection() {
 }
 
 
-func (cc *CrowdControl) attemptElection() {
+func (cc *CrowdControl) attemptElection_ml() {
   log.Printf("CC[%v] attempting election\n", cc.me)
   // try starting election if no initial view or if no recent heartbeat
-  args := &RequestVoteArgs{Primary: cc.me, View: cc.view + 1}
+  args := &RequestVoteArgs{Primary: cc.me, View: cc.nextView}
 
   numGranted := 0
   numAlreadyGranted := 0
@@ -211,14 +207,19 @@ func (cc *CrowdControl) attemptElection() {
     if numGranted > cc.numPeers / 2 {
       log.Printf("CC[%v] elected by %v/%v peers\n", cc.me, numGranted, cc.numPeers)
       // have a majority of votes
-      cc.view = cc.view + 1
-      cc.primary = cc.me
+      cc.setView_ml(cc.nextView, cc.me)
     } else if numRefused == 0 && numGranted + numAlreadyGranted > cc.numPeers / 2 {
-      // contention between multiple nodes to become leader; advance view
-      cc.view = cc.view + 1
-      cc.primary = -1
+      // contention between multiple nodes to become leader; try next view number
+      cc.nextView += 1
     }
   }()
+}
+
+
+func (cc *CrowdControl) setView_ml(view int, primary int) {
+  cc.view = view
+  cc.nextView = view + 1
+  cc.primary = primary
 }
 
 
@@ -278,6 +279,7 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.me = me
 
   cc.view = -1
+  cc.nextView = 0
   cc.primary = -1
 
   cc.votes = make(map[int]int)
