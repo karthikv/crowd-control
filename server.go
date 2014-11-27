@@ -9,6 +9,7 @@ import (
   "os"
   "syscall"
   "time"
+  "errors"
 )
 
 const (
@@ -19,12 +20,19 @@ const (
   HEARTBEAT_TIMEOUT = 25 * time.Millisecond
 
   SERVER_RPC_RETRIES = 3
-  OP_LOG_ENTRIES = 256
+  OP_LOG_CAPACITY = 256
 )
 
 
 // TODO: add random seed later
 // TODO: handle eviction
+
+
+/* Represents a mutex along with its number of users. */
+type SetMutex struct {
+  Mutex sync.Mutex
+  NumUsers int
+}
 
 
 /* Represents a single CrowdControl peer that maintains consensus over a set of
@@ -57,6 +65,12 @@ type CrowdControl struct {
 
   // whether the data for a given key on a given peer is invalid
   filter []map[string]bool
+
+  // operation log
+  ol *OperationLog
+
+  // maintains key -> lock mappings; must lock a given key while setting
+  setMutexes map[string]*SetMutex
 }
 
 
@@ -87,9 +101,9 @@ func (cc *CrowdControl) sendHeartbeat_ml() {
 
   makeParallelRPCs(cc.peers,
     // sends a Heartbeat RPC to the given peer
-    func(peer string) chan *RPCReply {
+    func(node int) chan *RPCReply {
       response := &HeartbeatResponse{}
-      return makeRPCRetry(peer, "CrowdControl.Heartbeat", args,
+      return makeRPCRetry(cc.peers[node], node, "CrowdControl.Heartbeat", args,
         response, SERVER_RPC_RETRIES)
     },
 
@@ -162,10 +176,10 @@ func (cc *CrowdControl) attemptElection_ml() {
 
   rpcCh := makeParallelRPCs(cc.peers,
     // sends a RequestVote RPC to the given peer
-    func(peer string) chan *RPCReply {
+    func(node int) chan *RPCReply {
       response := &RequestVoteResponse{}
-      return makeRPCRetry(peer, "CrowdControl.RequestVote", args,
-        response, SERVER_RPC_RETRIES)
+      return makeRPCRetry(cc.peers[node], node, "CrowdControl.RequestVote",
+        args, response, SERVER_RPC_RETRIES)
     },
 
     // aggregates RequestVote replies; determines when to stop collecting them
@@ -261,29 +275,185 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   return nil
 }
 
+func (cc *CrowdControl) acquireSetMutex(key string) *SetMutex {
+  cc.mutex.Lock()
+  setMutex, exists := cc.setMutexes[key]
+
+  if !exists {
+    setMutex = &SetMutex{NumUsers: 1}
+    cc.setMutexes[key] = setMutex
+  } else {
+    setMutex.NumUsers += 1
+  }
+  cc.mutex.Unlock()
+
+  setMutex.Mutex.Lock()
+  return setMutex
+}
+
+func (cc *CrowdControl) releaseSetMutex(key string, setMutex *SetMutex) {
+  setMutex.Mutex.Unlock()
+
+  cc.mutex.Lock()
+  setMutex.NumUsers -= 1
+  if setMutex.NumUsers == 0 {
+    delete(cc.setMutexes, key)
+  }
+  cc.mutex.Unlock()
+}
 
 func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
+  setMutex := cc.acquireSetMutex(args.Key)
   cc.mutex.Lock()
-  defer cc.mutex.Unlock()
-
+  
   if cc.primary != cc.me {
     // only the primary can handle set requests
     // TODO: should probably send back who the real primary is
+    cc.mutex.Unlock()
+    cc.releaseSetMutex(args.Key, setMutex)
     return nil
   }
 
-  value, exists := cc.cache[args.Key]
-  if exists && value == args.Value {
+  key, value := args.Key, args.Value
+  curValue, exists := cc.cache[key]
+  if exists && curValue == value {
     // already set this value (set likely in progress from earlier)
+    cc.mutex.Unlock()
+    cc.releaseSetMutex(args.Key, setMutex)
     return nil
   }
 
-  cc.cache[args.Key] = args.Value
+  cc.cache[key] = value
   for i, _ := range cc.peers {
-    cc.filter[i][args.Key] = true
+    cc.filter[i][key] = true
   }
 
+  op := &Operation{Add: true, Key: key}
+  cc.ol.Append(op)
 
+  // TODO: add waiting for leases to expire
+  majority := false
+  nonce := cc.ol.GetNextOpNum()
+  for !majority {
+    numPrepped := 0
+    refused := false
+
+    rpcCh := makeParallelRPCs(cc.peers,
+      // sends a Prep RPC to the given peer
+      func(node int) chan *RPCReply {
+        invalid, ops := cc.ol.GetPending(node)
+        args := &PrepArgs{
+          View: cc.view, 
+          Invalid: invalid, 
+          Ops: ops, 
+          Nonce: nonce,
+        }
+        response := &PrepResponse{}
+        return makeRPCRetry(cc.peers[node], node, "CrowdControl.Prep", args,
+          response, SERVER_RPC_RETRIES)
+      },
+
+      // aggregates Prep replies; determines when to stop collecting them
+      func(reply *RPCReply) bool {
+        if reply.Success {
+          // compute number of granted and already granted votes
+          prepResponse := reply.Data.(*PrepResponse)
+
+          if prepResponse.Status == PREP_SUCCESS {
+            numPrepped += 1
+            if numPrepped > cc.numPeers / 2 {
+              return true
+            }
+          } else if prepResponse.Status == PREP_REFUSED {
+            refused = true
+            return true
+          }
+        }
+        return false
+      }, ELECTION_RPCS_TIMEOUT)
+
+
+    originalView := cc.view
+    cc.mutex.Unlock()
+
+    // wait for replies; don't block get requests
+    replies := <-rpcCh
+
+    cc.mutex.Lock()
+    defer cc.mutex.Unlock()
+
+    if cc.view > originalView || refused {
+      // we've made a transition to a new view; don't proceed
+      cc.releaseSetMutex(args.Key, setMutex)
+      return errors.New("set aborted due to view change")
+    }
+
+    for _, reply := range replies {
+      if reply.Success && reply.Data.(*PrepResponse).Status == PREP_SUCCESS {
+        cc.ol.FastForward(reply.Node)
+      }
+    }
+
+    majority = (numPrepped <= cc.numPeers / 2)
+    if majority {
+      // successfully prepped
+      log.Printf("CC[%v] set by %v/%v peers\n", cc.me, numPrepped, cc.numPeers)
+    }
+  }
+
+  go func() {
+    cc.mutex.Lock()
+
+    originalView := cc.view
+    committedNodes := make([]int, 0, cc.numPeers)
+    rpcCh := makeParallelRPCs(cc.peers,
+      // sends a Commit RPC to the given peer
+      func(node int) chan *RPCReply {
+        args := &CommitArgs{
+          View: cc.view, 
+          Key: key,
+          Value: value,
+          Nonce: nonce,
+        }
+        response := &CommitResponse{}
+        return makeRPCRetry(cc.peers[node], node, "CrowdControl.Commit", args,
+          response, SERVER_RPC_RETRIES)
+      },
+
+      // aggregates Commit replies; determines when to stop collecting them
+      func(reply *RPCReply) bool {
+        if reply.Success {
+          // compute number of granted and already granted votes
+          commitResponse := reply.Data.(*CommitResponse)
+          if commitResponse.Success {
+            // possible view change; reply handlers can happen without lock
+            cc.mutex.Lock()
+            if cc.view == originalView {
+              cc.filter[reply.Node][key] = false
+            }
+            cc.mutex.Unlock()
+            committedNodes = append(committedNodes, reply.Node)
+          }
+        }
+        return false
+      }, ELECTION_RPCS_TIMEOUT)
+  
+    cc.mutex.Unlock()
+    
+    <-rpcCh
+
+    cc.mutex.Lock()
+    defer cc.mutex.Unlock()
+
+    if originalView < cc.view {
+      cc.releaseSetMutex(args.Key, setMutex)
+      return
+    }
+
+    op := &Operation{Add: false, Key: key, Nodes: committedNodes}
+    cc.ol.Append(op)
+    cc.releaseSetMutex(args.Key, setMutex)
+  }()
 
   return nil
 }
@@ -317,6 +487,11 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   for i := 0; i < cc.numPeers; i++ {
     cc.filter[i] = make(map[string]bool)
   }
+
+  cc.ol = &OperationLog{}
+  cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
+
+  cc.setMutexes = make(map[string]*SetMutex)
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)

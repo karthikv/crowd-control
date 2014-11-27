@@ -4,12 +4,9 @@ package cc
 /* Represents an add or remove operation to a node's filter. */
 type Operation struct {
   Add bool  // whether this is an add or remove operation
-
-  // for remove operations:
-  Nodes []int  // which nodes to remove from
-  Key string  // the key to remove
+  Key string  // the key to add/remove
+  Nodes []int  // for remove ops, which nodes to remove from
 }
-
 
 type OperationLog struct {
   start int  // beginning of ring buffer
@@ -33,7 +30,6 @@ func (ol *OperationLog) invalidateOldestNodes() {
   // maintain invariant oldest opNum == ol.start
   ol.updateStart()
 }
-
 
 func (ol *OperationLog) updateStart() {
   oldStart := ol.start
@@ -64,7 +60,7 @@ func (ol *OperationLog) Append(op *Operation)  {
 
 func (ol *OperationLog) FastForward(node int) {
   // if opNums[node] = n, node hasn't executed operation n and all future ops
-  ol.opNums[node] += (ol.start + ol.length) - ol.opNums[node]
+  ol.opNums[node] = (ol.start + ol.length)
 
   // maintain invariant oldest opNum == ol.start
   ol.updateStart()
@@ -90,6 +86,9 @@ func (ol *OperationLog) GetPending(node int) (bool, []Operation) {
   return false, pendingOps
 }
 
+func (ol *OperationLog) GetNextOpNum() int {
+  return ol.start + ol.length
+}
 
 func (ol *OperationLog) Init(capacity int, numNodes int) {
   ol.start = 0
@@ -99,3 +98,4 @@ func (ol *OperationLog) Init(capacity int, numNodes int) {
   ol.ops = make([]Operation, capacity, capacity)
   ol.opNums = make([]int, numNodes, numNodes)
 }
+

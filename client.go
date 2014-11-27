@@ -15,7 +15,7 @@ func (client *Client) Get(key string) (string, bool) {
   // TODO: try different servers
   args := &GetArgs{Key: key}
   response := &GetResponse{}
-  ch := makeRPCRetry(client.servers[0], "CrowdControl.Get", args, response, CLIENT_RPC_RETRIES)
+  ch := makeRPCRetry(client.servers[0], 0, "CrowdControl.Get", args, response, CLIENT_RPC_RETRIES)
 
   reply := <-ch
   if reply.Success {
@@ -32,7 +32,7 @@ func (client *Client) Set(key string, value string) bool {
   // TODO: send to primary
   args := &SetArgs{Key: key, Value: value}
   response := &SetResponse{}
-  ch := makeRPCRetry(client.servers[0], "CrowdControl.Set", args, response, CLIENT_RPC_RETRIES)
+  ch := makeRPCRetry(client.servers[0], 0, "CrowdControl.Set", args, response, CLIENT_RPC_RETRIES)
 
   reply := <-ch
   if reply.Success {

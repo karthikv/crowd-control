@@ -17,11 +17,21 @@ const (
 
   // vote refused, as a primary already exists or there's a newer view
   VOTE_REFUSED = iota
+
+  // successfully prepared for operation
+  PREP_SUCCESS = iota
+
+  // can't prep because in a later view
+  PREP_REFUSED = iota
+
+  // can't prepare until up-to-date
+  PREP_DELAYED = iota
 )
 
 
 /* An RPC response can return failure or data. */
 type RPCReply struct {
+  Node int
   Success bool
   Data interface{}
 }
@@ -68,18 +78,43 @@ type HeartbeatArgs struct {
 type HeartbeatResponse struct {
 }
 
+/* The Prep() RPC prepares a key value pair for insertion */
+type PrepArgs struct {
+  View int
+  Invalid bool 
+  Nonce int
+  Ops []Operation
+}
+
+type PrepResponse struct {
+  Status byte
+}
+
+/* The Commit() RPC commits a key value pair for insertion */
+type CommitArgs struct {
+  View int
+  Nonce int
+  Key string
+  Value string
+}
+
+type CommitResponse struct {
+  Success bool
+  // TODO: add evicted keys
+}
 
 const RPC_TIMEOUT = 10 * time.Millisecond
 
 /* Makes an RPC to the given `peer`, calling the function specified by `name`.
  * Passes in the arguments `args`. Requires an allocated `response` that can
  * hold the reply data. Returns a channel that holds the reply. */
-func makeRPC(peer string, name string, args interface{}, response interface{}) chan *RPCReply {
+func makeRPC(peer string, node int, name string, args interface{}, 
+    response interface{}) chan *RPCReply {
   rpcCh := make(chan *RPCReply, 1)
 
   go func() {
     // make RPC call, putting result in channel
-    reply := &RPCReply{}
+    reply := &RPCReply{Node: node}
     conn, err := rpc.Dial("unix", peer)
 
     if err != nil {
@@ -119,13 +154,13 @@ func makeRPC(peer string, name string, args interface{}, response interface{}) c
 
 // TODO: should numRetries be a param?
 /* Makes an RPC, as per `makeRPC`. Retries `numRetries` times. */
-func makeRPCRetry(peer string, name string, args interface{}, replyType interface{},
-    numRetries int) chan *RPCReply {
+func makeRPCRetry(peer string, node int, name string, args interface{}, 
+    replyType interface{}, numRetries int) chan *RPCReply {
   replyCh := make(chan *RPCReply, 1)
 
   go func() {
     for i := 0; i < numRetries; i++ {
-      ch := makeRPC(peer, name, args, replyType)
+      ch := makeRPC(peer, node, name, args, replyType)
       reply := <-ch
 
       // use result of the first successful RPC, or the last RPC if others fail
@@ -141,7 +176,7 @@ func makeRPCRetry(peer string, name string, args interface{}, replyType interfac
 
 
 /* Takes in a peer, sends an RPC, returns a channel that gives the results. */
-type sendRPCFn func(string) chan *RPCReply
+type sendRPCFn func(int) chan *RPCReply
 
 /* Takes in a reply, returns whether to stop processing. */
 type replyRPCFn func(*RPCReply) bool
@@ -163,15 +198,15 @@ func makeParallelRPCs(peers []string, sendCb sendRPCFn, replyCb replyRPCFn,
 
   // send RPCs
   for i, _ := range peers {
-    go func(peer string) {
-      ch := sendCb(peer)
+    go func(node int) {
+      ch := sendCb(node)
       select {
       case reply := <-ch:
         replyCh <- reply
       case <-doneCh:
         return
       }
-    }(peers[i])
+    }(i)
   }
 
   // collect results, appending them to an array
