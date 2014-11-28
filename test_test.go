@@ -9,7 +9,8 @@ import (
 func TestLeaderElection(testing *testing.T) {
   log.Printf("TestLeaderElection(): Begin\n")
 
-  peers := []string{"/tmp/0.sock", "/tmp/1.sock", "/tmp/2.sock", "/tmp/3.sock", "/tmp/4.sock"}
+  peers := []string{"/tmp/le0.sock", "/tmp/le1.sock", "/tmp/le2.sock",
+    "/tmp/le3.sock", "/tmp/le4.sock"}
   ccs := make([]*CrowdControl, len(peers))
 
   for i, _ := range peers {
@@ -74,6 +75,7 @@ func TestLeaderElection(testing *testing.T) {
     time.Sleep(1 * time.Second)
   }
 
+  log.Printf("Primary %v going down\n", primary)
   ccs[primary].dead = true
   time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
 
@@ -90,6 +92,8 @@ func TestLeaderElection(testing *testing.T) {
       testing.Fatalf("View change without majority: %v to %v\n", view, cc.view)
     }
   }
+
+  log.Printf("Done leader test", primary)
 }
 
 func checkBasicGetSetOps(testing *testing.T, client *Client) {
@@ -130,7 +134,7 @@ func checkBasicGetSetOps(testing *testing.T, client *Client) {
 func TestGetSetSingle(testing *testing.T) {
   log.Printf("TestGetSetSingle(): Begin\n")
 
-  peers := []string{"/tmp/0.sock"}
+  peers := []string{"/tmp/gss0.sock"}
   ccs := make([]*CrowdControl, len(peers))
 
   for i, _ := range peers {
@@ -153,7 +157,8 @@ func TestGetSetSingle(testing *testing.T) {
 func TestGetSetMultiple(testing *testing.T) {
   log.Printf("TestGetSetMultiple(): Begin\n")
 
-  peers := []string{"/tmp/0.sock", "/tmp/1.sock", "/tmp/2.sock", "/tmp/3.sock", "/tmp/4.sock"}
+  peers := []string{"/tmp/gsm0.sock", "/tmp/gsm1.sock", "/tmp/gsm2.sock",
+    "/tmp/gsm3.sock", "/tmp/gsm4.sock"}
   ccs := make([]*CrowdControl, len(peers))
 
   for i, _ := range peers {
