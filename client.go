@@ -1,20 +1,26 @@
 package cc
 
-import "time"
+import (
+  "time"
+  "sync"
+)
 
 type Client struct {
-  // TODO: mutex for syncrhonization?
+  mutex sync.Mutex
   servers []string
   primary int
 }
 
 const (
   CLIENT_RPC_RETRIES = 3
-  SET_RPCS_TIMEOUT = 50
+  SET_RPCS_TIMEOUT = 50 * time.Millisecond
 )
 
 
 func (client *Client) Get(key string) (string, bool) {
+  client.mutex.Lock()
+  defer client.mutex.Unlock()
+
   // TODO: try different servers
   args := &GetArgs{Key: key}
   response := &GetResponse{}
@@ -45,6 +51,9 @@ func (client *Client) Get(key string) (string, bool) {
 
 
 func (client *Client) Set(key string, value string) {
+  client.mutex.Lock()
+  defer client.mutex.Unlock()
+
   args := &SetArgs{Key: key, Value: value}
   success := false
   waitTime := 10 * time.Millisecond
