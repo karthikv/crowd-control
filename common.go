@@ -4,10 +4,17 @@ import (
   "log"
   "net/rpc"
   "time"
+  "crypto/sha256"
 )
 
 const (
   OK = iota
+
+  // get operation succeded
+  GET_SUCCESS = iota
+
+  // can't get because peer isn't up-to-date
+  GET_DELAYED = iota
 
   // vote given to this node
   VOTE_GRANTED = iota
@@ -32,6 +39,15 @@ const (
 
   // can't prepare until up-to-date
   PREP_DELAYED = iota
+
+  // lease given to this node
+  LEASE_GRANTED = iota
+
+  // lease given, but node first has to update its filter
+  LEASE_UPDATE_FILTER = iota
+
+  // lease refused, as there's a later view
+  LEASE_REFUSED = iota
 )
 
 
@@ -49,6 +65,7 @@ type GetArgs struct {
 }
 
 type GetResponse struct {
+  Status byte
   Exists bool
   Value string
 }
@@ -85,6 +102,7 @@ type HeartbeatArgs struct {
 type HeartbeatResponse struct {
 }
 
+
 /* The Prep() RPC prepares a key value pair for insertion. */
 type PrepArgs struct {
   View int
@@ -96,6 +114,7 @@ type PrepArgs struct {
 type PrepResponse struct {
   Status byte
 }
+
 
 /* The Commit() RPC inserts/updates a key value pair. */
 type CommitArgs struct {
@@ -109,6 +128,22 @@ type CommitResponse struct {
   Success bool
   // TODO: add evicted keys
 }
+
+
+/* The RequestLease() RPC requests a lease to handle get requests. */
+type RequestLeaseArgs struct {
+  View int
+  Node int  // sending node
+  FilterHash [sha256.Size]byte
+  Now time.Time
+}
+
+type RequestLeaseResponse struct {
+  Status byte
+  Filter map[string]bool
+  Until time.Time
+}
+
 
 const RPC_TIMEOUT = 10 * time.Millisecond
 

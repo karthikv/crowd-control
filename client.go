@@ -18,16 +18,29 @@ func (client *Client) Get(key string) (string, bool) {
   // TODO: try different servers
   args := &GetArgs{Key: key}
   response := &GetResponse{}
-  ch := makeRPCRetry(client.servers[0], 0, "CrowdControl.Get", args, response, CLIENT_RPC_RETRIES)
+  waitTime := 10 * time.Millisecond
 
-  reply := <-ch
-  if reply.Success {
-    getResponse := reply.Data.(*GetResponse)
-    return getResponse.Value, getResponse.Exists
+  lastServer := len(client.servers) - 1
+
+  for {
+    ch := makeRPCRetry(client.servers[lastServer], lastServer, "CrowdControl.Get", args, response,
+      CLIENT_RPC_RETRIES)
+    reply := <-ch
+
+    if reply.Success {
+      getResponse := reply.Data.(*GetResponse)
+
+      if getResponse.Status == GET_SUCCESS {
+        return getResponse.Value, getResponse.Exists
+      }
+    }
+
+    // throttle requests
+    time.Sleep(waitTime)
+    if waitTime < 10 * time.Second {
+      waitTime *= 2
+    }
   }
-
-  // assume key doesn't exist
-  return "", false
 }
 
 

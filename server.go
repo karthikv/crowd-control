@@ -10,14 +10,16 @@ import (
   "syscall"
   "time"
   "errors"
+  "crypto/sha256"
 )
 
 const (
   ELECTION_TIMEOUT_MIN = 150
   ELECTION_TIMEOUT_MAX = 300
-
   ELECTION_RPCS_TIMEOUT = 100 * time.Millisecond
+
   HEARTBEAT_TIMEOUT = 25 * time.Millisecond
+  LEASE_DURATION = 10 * time.Second
 
   SERVER_RPC_RETRIES = 3
   OP_LOG_CAPACITY = 256
@@ -63,8 +65,8 @@ type CrowdControl struct {
   // key-value pairs
   cache map[string]string
 
-  // whether the data for a given key on a given peer is invalid
-  filter []map[string]bool
+  // whether the data for a given key on a given node is invalid
+  filters []map[string]bool
 
   // operation log
   ol *OperationLog
@@ -74,6 +76,12 @@ type CrowdControl struct {
 
   // if we've prepped for a given nonce; nonce -> status mapping
   prepped map[int]bool
+
+  // lease to respond to get requests
+  leaseUntil time.Time
+
+  // leases granted by primary to nodes; node -> lease expiry mapping
+  leases []time.Time
 }
 
 
@@ -274,36 +282,113 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
-  response.Value, response.Exists = cc.cache[args.Key]
+  if cc.leaseUntil.Sub(time.Now()) <= 0 {
+    if cc.primary == cc.me {
+      // TODO: handle network partition case here
+      // primary can extend its own lease
+      cc.leaseUntil = time.Now().Add(LEASE_DURATION)
+    } else {
+      // must get lease from primary
+      leaseArgs := &RequestLeaseArgs{
+        View: cc.view,
+        Node: cc.me,
+        FilterHash: cc.hashFilter(cc.filters[cc.me]),
+        Now: time.Now(),
+      }
+
+      ch := makeRPCRetry(cc.peers[cc.primary], cc.primary, "CrowdControl.RequestLease",
+        &leaseArgs, &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
+      reply := <-ch
+
+      if reply.Success {
+        leaseResponse := reply.Data.(*RequestLeaseResponse)
+
+        // TODO: case where filter is too full; need to recover?
+        if leaseResponse.Status == LEASE_GRANTED {
+          log.Printf("got granted for req lease\n")
+          cc.leaseUntil = leaseResponse.Until
+        } else if leaseResponse.Status == LEASE_REFUSED {
+          log.Printf("got refused for req lease\n")
+          return errors.New("get aborted due to view change")
+        } else if leaseResponse.Status == LEASE_UPDATE_FILTER {
+          log.Printf("got update for req lease\n")
+          cc.filters[cc.me] = leaseResponse.Filter
+          cc.leaseUntil = leaseResponse.Until
+        }
+      } else {
+        return errors.New("could not get lease")
+      }
+    }
+  }
+
+  if cc.filters[cc.me][args.Key] {
+    // not up-to-date for this key
+    response.Status = GET_DELAYED
+    // TODO: ask other server for k/v pair
+  } else {
+    response.Status = GET_SUCCESS
+    response.Value, response.Exists = cc.cache[args.Key]
+  }
+
   return nil
 }
 
-func (cc *CrowdControl) acquireSetMutex(key string) *SetMutex {
-  cc.mutex.Lock()
-  setMutex, exists := cc.setMutexes[key]
 
-  if !exists {
-    setMutex = &SetMutex{NumUsers: 1}
-    cc.setMutexes[key] = setMutex
+func (cc *CrowdControl) hashFilter(filter map[string]bool) [sha256.Size]byte {
+  numBytes := 0
+  for key, _ := range filter {
+    numBytes += len(key)
+  }
+
+  // create array of bytes corresponding to keys
+  bytes := make([]byte, 0, numBytes)
+  for key, _ := range filter {
+    bytes = append(bytes, []byte(key)...)
+  }
+
+  return sha256.Sum256(bytes)
+}
+
+
+func (cc *CrowdControl) nodeHasFilterHash(node int, filterHash [sha256.Size]byte) bool {
+  hash := cc.hashFilter(cc.filters[node])
+
+  if len(hash) != len(filterHash) {
+    return false
+  }
+
+  for i, value := range hash {
+    if value != filterHash[i] {
+      return false
+    }
+  }
+
+  return true
+}
+
+
+func (cc *CrowdControl) RequestLease(args *RequestLeaseArgs,
+    response *RequestLeaseResponse) error {
+  cc.mutex.Lock()
+  defer cc.mutex.Unlock()
+
+  if cc.primary != cc.me || args.View != cc.view {
+    response.Status = LEASE_REFUSED
+    return nil
+  }
+
+  if cc.nodeHasFilterHash(args.Node, args.FilterHash) {
+    response.Status = LEASE_GRANTED
   } else {
-    setMutex.NumUsers += 1
+    response.Status = LEASE_UPDATE_FILTER
+    response.Filter = cc.filters[args.Node]
   }
-  cc.mutex.Unlock()
 
-  setMutex.Mutex.Lock()
-  return setMutex
+  response.Until = args.Now.Add(LEASE_DURATION)
+  cc.leases[args.Node] = time.Now().Add(LEASE_DURATION)
+  return nil
 }
 
-func (cc *CrowdControl) releaseSetMutex(key string, setMutex *SetMutex) {
-  setMutex.Mutex.Unlock()
-
-  cc.mutex.Lock()
-  setMutex.NumUsers -= 1
-  if setMutex.NumUsers == 0 {
-    delete(cc.setMutexes, key)
-  }
-  cc.mutex.Unlock()
-}
 
 func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   key, value := args.Key, args.Value
@@ -329,7 +414,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
   cc.cache[key] = value
   for i, _ := range cc.peers {
-    cc.filter[i][key] = true
+    cc.filters[i][key] = true
   }
 
   op := &Operation{Add: true, Key: key}
@@ -342,6 +427,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     numPrepped := 0
     refused := false
 
+    // TODO: either throttle RPC retries or just error, expecting client retry
     rpcCh := makeParallelRPCs(cc.peers,
       // sends a Prep RPC to the given peer
       func(node int) chan *RPCReply {
@@ -435,7 +521,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
             // possible view change; reply handlers can happen without lock
             cc.mutex.Lock()
             if cc.view == originalView {
-              cc.filter[reply.Node][key] = false
+              delete(cc.filters[reply.Node], key)
             }
             cc.mutex.Unlock()
             committedNodes = append(committedNodes, reply.Node)
@@ -466,6 +552,35 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   response.Status = SET_SUCCESS
   cc.mutex.Unlock()
   return nil
+}
+
+
+func (cc *CrowdControl) acquireSetMutex(key string) *SetMutex {
+  cc.mutex.Lock()
+  setMutex, exists := cc.setMutexes[key]
+
+  if !exists {
+    setMutex = &SetMutex{NumUsers: 1}
+    cc.setMutexes[key] = setMutex
+  } else {
+    setMutex.NumUsers += 1
+  }
+  cc.mutex.Unlock()
+
+  setMutex.Mutex.Lock()
+  return setMutex
+}
+
+
+func (cc *CrowdControl) releaseSetMutex(key string, setMutex *SetMutex) {
+  setMutex.Mutex.Unlock()
+
+  cc.mutex.Lock()
+  setMutex.NumUsers -= 1
+  if setMutex.NumUsers == 0 {
+    delete(cc.setMutexes, key)
+  }
+  cc.mutex.Unlock()
 }
 
 
@@ -504,12 +619,12 @@ func (cc *CrowdControl) performOp(op *Operation) {
   if op.Add {
     // add operations apply to all nodes
     for node, _ := range cc.peers {
-      cc.filter[node][op.Key] = true
+      cc.filters[node][op.Key] = true
     }
   } else {
     // remove operations apply to nodes in op.Nodes
     for node, _ := range op.Nodes {
-      delete(cc.filter[node], op.Key)
+      delete(cc.filters[node], op.Key)
     }
   }
 }
@@ -538,6 +653,7 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
   }
 
   cc.cache[args.Key] = args.Value
+  delete(cc.filters[cc.me], args.Key)
   // TODO: Need to garbage collect prepped somehow. We can't just delete
   // cc.prepped[args.Nonce] here because the response could get lost.
   // Perhaps if we associate nonces with the log, we can delete a nonce
@@ -573,10 +689,10 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.scheduleHeartbeat()
 
   cc.cache = make(map[string]string)
-  cc.filter = make([]map[string]bool, cc.numPeers)
+  cc.filters = make([]map[string]bool, cc.numPeers, cc.numPeers)
 
   for i := 0; i < cc.numPeers; i++ {
-    cc.filter[i] = make(map[string]bool)
+    cc.filters[i] = make(map[string]bool)
   }
 
   cc.ol = &OperationLog{}
@@ -584,6 +700,13 @@ func (cc *CrowdControl) Init(peers []string, me int) {
 
   cc.setMutexes = make(map[string]*SetMutex)
   cc.prepped = make(map[int]bool)
+
+  cc.leaseUntil = time.Now()
+  cc.leases = make([]time.Time, cc.numPeers, cc.numPeers)
+
+  for i := 0; i < cc.numPeers; i++ {
+    cc.leases[i] = time.Now()
+  }
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)
