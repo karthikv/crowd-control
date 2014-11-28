@@ -71,6 +71,9 @@ type CrowdControl struct {
 
   // maintains key -> lock mappings; must lock a given key while setting
   setMutexes map[string]*SetMutex
+
+  // if we've prepped for a given nonce; nonce -> status mapping
+  prepped map[int]bool
 }
 
 
@@ -303,23 +306,24 @@ func (cc *CrowdControl) releaseSetMutex(key string, setMutex *SetMutex) {
 }
 
 func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
-  setMutex := cc.acquireSetMutex(args.Key)
+  key, value := args.Key, args.Value
+  setMutex := cc.acquireSetMutex(key)
   cc.mutex.Lock()
-  
+
   if cc.primary != cc.me {
     // only the primary can handle set requests
-    // TODO: should probably send back who the real primary is
+    response.Status = SET_REFUSED
     cc.mutex.Unlock()
-    cc.releaseSetMutex(args.Key, setMutex)
+    cc.releaseSetMutex(key, setMutex)
     return nil
   }
 
-  key, value := args.Key, args.Value
   curValue, exists := cc.cache[key]
   if exists && curValue == value {
     // already set this value (set likely in progress from earlier)
+    response.Status = SET_SUCCESS
     cc.mutex.Unlock()
-    cc.releaseSetMutex(args.Key, setMutex)
+    cc.releaseSetMutex(key, setMutex)
     return nil
   }
 
@@ -343,9 +347,9 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
       func(node int) chan *RPCReply {
         invalid, ops := cc.ol.GetPending(node)
         args := &PrepArgs{
-          View: cc.view, 
-          Invalid: invalid, 
-          Ops: ops, 
+          View: cc.view,
+          Invalid: invalid,
+          Ops: ops,
           Nonce: nonce,
         }
         response := &PrepResponse{}
@@ -380,22 +384,23 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     replies := <-rpcCh
 
     cc.mutex.Lock()
-    defer cc.mutex.Unlock()
 
     if cc.view > originalView || refused {
+      // TODO: handle refused more explicitly?
       // we've made a transition to a new view; don't proceed
-      cc.releaseSetMutex(args.Key, setMutex)
+      cc.mutex.Unlock()
+      cc.releaseSetMutex(key, setMutex)
       return errors.New("set aborted due to view change")
     }
 
-    for _, reply := range replies {
-      if reply.Success && reply.Data.(*PrepResponse).Status == PREP_SUCCESS {
-        cc.ol.FastForward(reply.Node)
-      }
-    }
-
-    majority = (numPrepped <= cc.numPeers / 2)
+    majority = (numPrepped > cc.numPeers / 2)
     if majority {
+      for _, reply := range replies {
+        if reply.Success && reply.Data.(*PrepResponse).Status == PREP_SUCCESS {
+          cc.ol.FastForward(reply.Node)
+        }
+      }
+
       // successfully prepped
       log.Printf("CC[%v] set by %v/%v peers\n", cc.me, numPrepped, cc.numPeers)
     }
@@ -406,11 +411,12 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
     originalView := cc.view
     committedNodes := make([]int, 0, cc.numPeers)
+
     rpcCh := makeParallelRPCs(cc.peers,
       // sends a Commit RPC to the given peer
       func(node int) chan *RPCReply {
         args := &CommitArgs{
-          View: cc.view, 
+          View: cc.view,
           Key: key,
           Value: value,
           Nonce: nonce,
@@ -437,24 +443,109 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         }
         return false
       }, ELECTION_RPCS_TIMEOUT)
-  
+
     cc.mutex.Unlock()
-    
+
     <-rpcCh
 
     cc.mutex.Lock()
-    defer cc.mutex.Unlock()
 
-    if originalView < cc.view {
-      cc.releaseSetMutex(args.Key, setMutex)
+    if cc.view > originalView {
+      cc.mutex.Unlock()
+      cc.releaseSetMutex(key, setMutex)
       return
     }
 
     op := &Operation{Add: false, Key: key, Nodes: committedNodes}
     cc.ol.Append(op)
-    cc.releaseSetMutex(args.Key, setMutex)
+
+    cc.mutex.Unlock()
+    cc.releaseSetMutex(key, setMutex)
   }()
 
+  response.Status = SET_SUCCESS
+  cc.mutex.Unlock()
+  return nil
+}
+
+
+func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
+  cc.mutex.Lock()
+  defer cc.mutex.Unlock()
+
+  if cc.view > args.View {
+    response.Status = PREP_REFUSED
+    return nil
+  }
+
+  if cc.view < args.View || args.Invalid {
+    // TODO: somehow update my view?
+    response.Status = PREP_DELAYED
+    return nil
+  }
+
+  if cc.prepped[args.Nonce] {
+    response.Status = PREP_SUCCESS
+    return nil
+  }
+
+  numOps := len(args.Ops)
+  for i := 0; i < numOps; i++ {
+    cc.performOp(&args.Ops[i])
+  }
+
+  cc.prepped[args.Nonce] = true
+  response.Status = PREP_SUCCESS
+  return nil
+}
+
+
+func (cc *CrowdControl) performOp(op *Operation) {
+  if op.Add {
+    // add operations apply to all nodes
+    for node, _ := range cc.peers {
+      cc.filter[node][op.Key] = true
+    }
+  } else {
+    // remove operations apply to nodes in op.Nodes
+    for node, _ := range op.Nodes {
+      delete(cc.filter[node], op.Key)
+    }
+  }
+}
+
+
+func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error {
+  cc.mutex.Lock()
+  defer cc.mutex.Unlock()
+
+  if cc.view > args.View {
+    // TODO: inform of new view?
+    response.Success = false
+    return nil
+  }
+
+  if cc.view < args.View {
+    // TODO: somehow update my view?
+    response.Success = false
+    return nil
+  }
+
+  if !cc.prepped[args.Nonce] {
+    // can't commit if we didn't prep; need to get up-to-date
+    response.Success = false
+    return nil
+  }
+
+  cc.cache[args.Key] = args.Value
+  // TODO: Need to garbage collect prepped somehow. We can't just delete
+  // cc.prepped[args.Nonce] here because the response could get lost.
+  // Perhaps if we associate nonces with the log, we can delete a nonce
+  // as soon as we see a remove operation for it. More simply, we could
+  // just keep hold of the latest N preps, and delete after that
+  // (sufficiently low probability that prep will come up again)
+
+  response.Success = true
   return nil
 }
 
@@ -492,6 +583,7 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
 
   cc.setMutexes = make(map[string]*SetMutex)
+  cc.prepped = make(map[int]bool)
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)

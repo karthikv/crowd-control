@@ -92,32 +92,12 @@ func TestLeaderElection(testing *testing.T) {
   }
 }
 
-func TestGetSetSingle(testing *testing.T) {
-  log.Printf("TestGetSetSingle(): Begin\n")
+func checkBasicGetSetOps(testing *testing.T, client *Client) {
+  client.Set("foo", "bar")
+  client.Set("john", "doe")
 
-  peers := []string{"/tmp/0.sock"}
-  ccs := make([]*CrowdControl, len(peers))
-
-  for i, _ := range peers {
-    cc := &CrowdControl{}
-    cc.Init(peers, i)
-    ccs[i] = cc
-  }
-
-  var client Client
-  client.Init(peers)
-
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
-
-  ok := client.Set("foo", "bar")
-  if !ok {
-    testing.Fatal("Set foo -> bar failed\n")
-  }
-
-  ok = client.Set("john", "doe")
-  if !ok {
-    testing.Fatal("Set john -> doe failed\n")
-  }
+  // wait for values to propagate
+  time.Sleep(100 * time.Microsecond)
 
   value, exists := client.Get("foo")
   if !(exists && value == "bar") {
@@ -144,6 +124,50 @@ func TestGetSetSingle(testing *testing.T) {
   if exists {
     testing.Fatal("Key should not exist: Foo\n")
   }
+}
 
+// single client, single server
+func TestGetSetSingle(testing *testing.T) {
+  log.Printf("TestGetSetSingle(): Begin\n")
+
+  peers := []string{"/tmp/0.sock"}
+  ccs := make([]*CrowdControl, len(peers))
+
+  for i, _ := range peers {
+    cc := &CrowdControl{}
+    cc.Init(peers, i)
+    ccs[i] = cc
+  }
+
+  var client Client
+  client.Init(peers)
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  checkBasicGetSetOps(testing, &client)
   log.Printf("TestGetSetSingle(): End\n")
+}
+
+// multiple server, single client
+func TestGetSetMultiple(testing *testing.T) {
+  log.Printf("TestGetSetMultiple(): Begin\n")
+
+  peers := []string{"/tmp/0.sock", "/tmp/1.sock", "/tmp/2.sock", "/tmp/3.sock", "/tmp/4.sock"}
+  ccs := make([]*CrowdControl, len(peers))
+
+  for i, _ := range peers {
+    cc := &CrowdControl{}
+    cc.Init(peers, i)
+    ccs[i] = cc
+  }
+
+  var client Client
+  client.Init(peers)
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  checkBasicGetSetOps(testing, &client)
+  log.Printf("TestGetSetMultiple(): End\n")
 }

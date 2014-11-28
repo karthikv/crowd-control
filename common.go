@@ -18,6 +18,12 @@ const (
   // vote refused, as a primary already exists or there's a newer view
   VOTE_REFUSED = iota
 
+  // set operation succeeded
+  SET_SUCCESS = iota
+
+  // set operation failed because this node isn't the primary
+  SET_REFUSED = iota
+
   // successfully prepared for operation
   PREP_SUCCESS = iota
 
@@ -55,6 +61,7 @@ type SetArgs struct {
 }
 
 type SetResponse struct {
+  Status byte
 }
 
 
@@ -78,10 +85,10 @@ type HeartbeatArgs struct {
 type HeartbeatResponse struct {
 }
 
-/* The Prep() RPC prepares a key value pair for insertion */
+/* The Prep() RPC prepares a key value pair for insertion. */
 type PrepArgs struct {
   View int
-  Invalid bool 
+  Invalid bool
   Nonce int
   Ops []Operation
 }
@@ -90,7 +97,7 @@ type PrepResponse struct {
   Status byte
 }
 
-/* The Commit() RPC commits a key value pair for insertion */
+/* The Commit() RPC inserts/updates a key value pair. */
 type CommitArgs struct {
   View int
   Nonce int
@@ -154,7 +161,7 @@ func makeRPC(peer string, node int, name string, args interface{},
 
 // TODO: should numRetries be a param?
 /* Makes an RPC, as per `makeRPC`. Retries `numRetries` times. */
-func makeRPCRetry(peer string, node int, name string, args interface{}, 
+func makeRPCRetry(peer string, node int, name string, args interface{},
     replyType interface{}, numRetries int) chan *RPCReply {
   replyCh := make(chan *RPCReply, 1)
 
