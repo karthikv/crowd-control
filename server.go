@@ -49,6 +49,9 @@ type CrowdControl struct {
   dead bool
   unreliable bool
 
+  reject map[string]bool
+  rejectMutex sync.Mutex
+
   // set of machines within the cluster
   peers []string  // node -> unix socket string
   numPeers int
@@ -114,15 +117,15 @@ func (cc *CrowdControl) scheduleHeartbeat() {
 
 
 func (cc *CrowdControl) sendHeartbeat_ml() {
-  log.Printf("CC[%v] sending heartbeats\n", cc.me)
+  // log.Printf("CC[%v] sending heartbeats\n", cc.me)
   args := &HeartbeatArgs{Primary: cc.primary, View: cc.view}
 
   makeParallelRPCs(cc.nodes,
     // sends a Heartbeat RPC to the given peer
     func(node int) chan *RPCReply {
       response := &HeartbeatResponse{}
-      return makeRPCRetry(cc.peers[node], node, "CrowdControl.Heartbeat", args,
-        response, SERVER_RPC_RETRIES)
+      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+        "CrowdControl.Heartbeat", args, response, SERVER_RPC_RETRIES)
     },
 
     // handles a Heartbeat response
@@ -146,7 +149,6 @@ func (cc *CrowdControl) Heartbeat(args *HeartbeatArgs, response *HeartbeatRespon
         cc.primary, args.Primary)
     }
 
-    log.Printf("CC[%v] primary asserted beat %v\n", cc.me, cc.primary)
     cc.lastHeartbeat = time.Now()
 
     // ensure electionTimerCh send is non-blocking
@@ -192,8 +194,9 @@ func (cc *CrowdControl) attemptElection_ml() {
   log.Printf("CC[%v] attempting election\n", cc.me)
   // try starting election if no initial view or if no recent heartbeat
   args := &RequestVoteArgs{
-    Primary: cc.me,
-    View: cc.nextView,
+    NextView: cc.nextView,
+    NextPrimary: cc.me,
+    View: cc.view,
     LatestOp: cc.latestOp,
   }
 
@@ -205,8 +208,8 @@ func (cc *CrowdControl) attemptElection_ml() {
     // sends a RequestVote RPC to the given peer
     func(node int) chan *RPCReply {
       response := &RequestVoteResponse{}
-      return makeRPCRetry(cc.peers[node], node, "CrowdControl.RequestVote",
-        args, response, SERVER_RPC_RETRIES)
+      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+        "CrowdControl.RequestVote", args, response, SERVER_RPC_RETRIES)
     },
 
     // aggregates RequestVote replies; determines when to stop collecting them
@@ -292,17 +295,21 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
-  if cc.view >= args.View || time.Now().Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN *
-      time.Millisecond {
-    log.Printf("CC[%v] vote refused for %v\n", cc.me, args.Primary)
+  if cc.view > args.View || cc.view >= args.NextView || time.Now().
+      Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN * time.Millisecond {
+    // log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
     // TODO: inform requester of view update
     response.Status = VOTE_REFUSED
     return nil
   }
 
-  vote, exists := cc.votes[args.View]
-  if exists {
-    if vote == args.Primary {
+  vote, exists := cc.votes[args.NextView]
+  if cc.view == args.View && cc.latestOp > args.LatestOp {
+    log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
+    // node not up-to-date
+    response.Status = VOTE_REFUSED
+  } else if exists {
+    if vote == args.NextPrimary {
       // vote has been granted to the requesting node
       response.Status = VOTE_GRANTED
     } else {
@@ -310,14 +317,9 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
       response.Status = VOTE_ALREADY_GRANTED
     }
   } else {
-    // only vote if other node is up-to-date
-    if cc.latestOp > args.LatestOp {
-      response.Status = VOTE_REFUSED
-    } else {
-      log.Printf("CC[%v] vote granted for %v\n", cc.me, args.Primary)
-      cc.votes[args.View] = args.Primary
-      response.Status = VOTE_GRANTED
-    }
+    log.Printf("CC[%v] vote granted for %v\n", cc.me, args.NextPrimary)
+    cc.votes[args.NextView] = args.NextPrimary
+    response.Status = VOTE_GRANTED
   }
 
   return nil
@@ -341,8 +343,9 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
         Now: time.Now(),
       }
 
-      ch := makeRPCRetry(cc.peers[cc.primary], cc.primary, "CrowdControl.RequestLease",
-        &leaseArgs, &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
+      ch := makeRPCRetry(cc.peers[cc.me], cc.peers[cc.primary], cc.primary,
+        "CrowdControl.RequestLease", &leaseArgs, &RequestLeaseResponse{},
+        SERVER_RPC_RETRIES)
       reply := <-ch
 
       if reply.Success {
@@ -620,8 +623,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           Nonce: nonce,
         }
 
-        return makeRPCRetry(cc.peers[node], node, "CrowdControl.Prep", args,
-          &PrepResponse{}, SERVER_RPC_RETRIES)
+        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+          "CrowdControl.Prep", args, &PrepResponse{}, SERVER_RPC_RETRIES)
       },
 
       // aggregates Prep replies; determines when to stop collecting them
@@ -702,8 +705,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           Nonce: nonce,
         }
         response := &CommitResponse{}
-        return makeRPCRetry(cc.peers[node], node, "CrowdControl.Commit", args,
-          response, SERVER_RPC_RETRIES)
+        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+          "CrowdControl.Commit", args, response, SERVER_RPC_RETRIES)
       },
 
       // aggregates Commit replies; determines when to stop collecting them
@@ -778,8 +781,9 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     makeParallelRPCs(leasedNodes,
       // sends a RevokeLease RPC to the given peer
       func(node int) chan *RPCReply {
-        return makeRPCRetry(cc.peers[node], node, "CrowdControl.RevokeLease", args,
-          &RevokeLeaseResponse{}, SERVER_RPC_RETRIES)
+        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+          "CrowdControl.RevokeLease", args, &RevokeLeaseResponse{},
+          SERVER_RPC_RETRIES)
       },
 
       // handles a RevokeLease response
@@ -934,12 +938,55 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
 }
 
 
+func (cc *CrowdControl) rejectConnFrom(node int) {
+  cc.rejectMutex.Lock()
+  defer cc.rejectMutex.Unlock()
+
+  peer := cc.peers[node]
+  cc.reject[peer] = true
+}
+
+
+func (cc *CrowdControl) rejectConnFromAll() {
+  cc.rejectMutex.Lock()
+  defer cc.rejectMutex.Unlock()
+
+  for i, peer := range cc.peers {
+    // don't reject from self
+    if i != cc.me {
+      cc.reject[peer] = true
+    }
+  }
+}
+
+
+func (cc *CrowdControl) acceptConnFrom(node int) {
+  cc.rejectMutex.Lock()
+  defer cc.rejectMutex.Unlock()
+
+  peer := cc.peers[node]
+  delete(cc.reject, peer)
+}
+
+
+func (cc *CrowdControl) acceptConnFromAll() {
+  cc.rejectMutex.Lock()
+  defer cc.rejectMutex.Unlock()
+
+  for _, peer := range cc.peers {
+    delete(cc.reject, peer)
+  }
+}
+
+
 /* Creates a CrowdControl peer. `peers` is an array of peers within the
  * cluster, where each element is a string representing a socket. `me` is the
  * index of this peer. */
 func (cc *CrowdControl) Init(peers []string, me int) {
   cc.dead = false
   cc.unreliable = false
+
+  cc.reject = make(map[string]bool)
 
   cc.peers = peers
   cc.numPeers = len(peers)
@@ -1007,7 +1054,17 @@ func (cc *CrowdControl) Init(peers []string, me int) {
       }
 
       if !cc.dead && err == nil {
-        if cc.unreliable && (rand.Int63() % 1000) < 100 {
+        // remove -sender suffix
+        sender := conn.RemoteAddr().String()
+        sender = sender[:len(sender) - 7]
+
+        cc.rejectMutex.Lock()
+        reject := cc.reject[sender]
+        cc.rejectMutex.Unlock()
+
+        if reject {
+          conn.Close()
+        } else if cc.unreliable && (rand.Int63() % 1000) < 100 {
           // 10% chance to drop request
           conn.Close()
         } else if cc.unreliable && (rand.Int63() % 1000) < 200 {

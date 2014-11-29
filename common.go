@@ -2,9 +2,12 @@ package cc
 
 import (
   "log"
+  "net"
   "net/rpc"
   "time"
   "crypto/sha256"
+  "os"
+  "fmt"
 )
 
 const (
@@ -109,8 +112,9 @@ type SetResponse struct {
 
 /* The RequestVote() RPC requests a vote from a peer for a new primary. */
 type RequestVoteArgs struct {
+  NextView int
+  NextPrimary int
   View int
-  Primary int
   LatestOp int
 }
 
@@ -206,27 +210,44 @@ type RevokeLeaseResponse struct {
 /* Makes an RPC to the given `peer`, calling the function specified by `name`.
  * Passes in the arguments `args`. Requires an allocated `response` that can
  * hold the reply data. Returns a channel that holds the reply. */
-func makeRPC(peer string, node int, name string, args interface{},
-    response interface{}) chan *RPCReply {
+func makeRPC(sender string, receiver string, receiverNode int, name string,
+    args interface{}, response interface{}) chan *RPCReply {
   rpcCh := make(chan *RPCReply, 1)
+  // suffix sender with "-sender" to not conflict with server socket
+  sender = fmt.Sprintf("%v-sender", sender)
 
   go func() {
     // make RPC call, putting result in channel
-    reply := &RPCReply{Node: node}
-    conn, err := rpc.Dial("unix", peer)
+    reply := &RPCReply{Node: receiverNode}
+
+    // configure connection
+    var d net.Dialer
+    senderAddr, err := net.ResolveUnixAddr("unix", sender)
 
     if err != nil {
-      log.Printf("Dial() failed: %v\n", err)
+      log.Printf("ResolveUnixAddr() failed: %v\n", err)
       reply.Success = false
       return
     }
 
+    os.Remove(sender)
+    d.LocalAddr = senderAddr
+    unixConn, err := d.Dial("unix", receiver)
+
+    if err != nil {
+      // log.Printf("Dial() failed: %v\n", err)
+      reply.Success = false
+      return
+    }
+
+    conn := rpc.NewClient(unixConn)
     defer conn.Close()
+
     reply.Data = response
     err = conn.Call(name, args, reply.Data)
 
     if err != nil {
-      log.Printf("Call() failed: %v\n", err)
+      // log.Printf("Call() failed: %v\n", err)
       reply.Success = false
       return
     }
@@ -252,13 +273,13 @@ func makeRPC(peer string, node int, name string, args interface{},
 
 // TODO: should numRetries be a param?
 /* Makes an RPC, as per `makeRPC`. Retries `numRetries` times. */
-func makeRPCRetry(peer string, node int, name string, args interface{},
-    replyType interface{}, numRetries int) chan *RPCReply {
+func makeRPCRetry(sender string, receiver string, receiverNode int, name string,
+    args interface{}, replyType interface{}, numRetries int) chan *RPCReply {
   replyCh := make(chan *RPCReply, 1)
 
   go func() {
     for i := 0; i < numRetries; i++ {
-      ch := makeRPC(peer, node, name, args, replyType)
+      ch := makeRPC(sender, receiver, receiverNode, name, args, replyType)
       reply := <-ch
 
       // use result of the first successful RPC, or the last RPC if others fail

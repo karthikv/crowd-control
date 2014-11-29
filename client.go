@@ -20,6 +20,7 @@ const (
 type Client struct {
   mutex sync.Mutex
   weightMutex sync.Mutex
+  socket string  // string representing socket address
 
   servers []string
   numServers int
@@ -44,7 +45,8 @@ func (client *Client) Get(key string) (string, bool) {
 
     for i, _ := range servers {
       go func(i int) {
-        ch := makeRPC(client.servers[i], i, "CrowdControl.Get", args, &GetResponse{})
+        ch := makeRPC(client.socket, client.servers[i], i, "CrowdControl.Get",
+          args, &GetResponse{})
         reply := <-ch
 
         if reply.Success {
@@ -140,8 +142,8 @@ func (client *Client) Set(key string, value string) {
         // sends a Set RPC to the given peer
         func(node int) chan *RPCReply {
           response := &SetResponse{}
-          return makeRPCRetry(client.servers[node], node, "CrowdControl.Set", args,
-            response, CLIENT_RPC_RETRIES)
+          return makeRPCRetry(client.socket, client.servers[node], node,
+            "CrowdControl.Set", args, response, CLIENT_RPC_RETRIES)
         },
 
         // finds a proper Set reply
@@ -162,8 +164,8 @@ func (client *Client) Set(key string, value string) {
       <-ch
     } else {
       response := &SetResponse{}
-      ch := makeRPCRetry(client.servers[client.primary], 0, "CrowdControl.Set", args,
-        response, CLIENT_RPC_RETRIES)
+      ch := makeRPCRetry(client.socket, client.servers[client.primary], 0,
+        "CrowdControl.Set", args, response, CLIENT_RPC_RETRIES)
 
       reply := <-ch
       if reply.Success {
@@ -189,7 +191,8 @@ func (client *Client) Set(key string, value string) {
   }
 }
 
-func (client *Client) Init(servers []string) {
+func (client *Client) Init(socket string, servers []string) {
+  client.socket = socket
   client.servers = servers
   client.numServers = len(servers)
 

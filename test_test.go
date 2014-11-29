@@ -1,40 +1,53 @@
 package cc
 
 import (
+  "fmt"
   "log"
   "testing"
   "time"
 )
 
-func TestLeaderElection(testing *testing.T) {
-  log.Printf("TestLeaderElection(): Begin\n")
+func makeCluster(numPeers int, prefix string) ([]string, []*CrowdControl) {
+  peers := make([]string, numPeers, numPeers)
+  for i := 0; i < numPeers; i++ {
+    peers[i] = fmt.Sprintf("/tmp/%v%v.sock", prefix, i)
+  }
+  ccs := make([]*CrowdControl, numPeers)
 
-  peers := []string{"/tmp/le0.sock", "/tmp/le1.sock", "/tmp/le2.sock",
-    "/tmp/le3.sock", "/tmp/le4.sock"}
-  ccs := make([]*CrowdControl, len(peers))
-
-  for i, _ := range peers {
+  for i := 0; i < numPeers; i++ {
     cc := &CrowdControl{}
     cc.Init(peers, i)
     ccs[i] = cc
   }
 
+  return peers, ccs
+}
+
+func checkView(t *testing.T, cc *CrowdControl, view int, primary int) {
+  if cc.primary != primary {
+    t.Fatalf("Disagreement on primary: %v and %v\n", primary, cc.primary)
+  }
+
+  if cc.view != view {
+    t.Fatalf("Disagreement on view: %v and %v\n", view, cc.view)
+  }
+}
+
+func TestLeaderElection(t *testing.T) {
+  log.Printf("\n\nTestLeaderElection(): Begin\n\n")
+
+  _, ccs := makeCluster(5, "le")
   time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
   primary := ccs[0].primary
   view := ccs[0].view
 
   if primary == -1 {
-    testing.Fatalf("No primary elected after %v ms\n", 2 * ELECTION_TIMEOUT_MAX)
+    t.Fatalf("No primary elected\n")
   }
 
   for _, cc := range ccs {
-    if cc.primary != primary {
-      testing.Fatalf("Disagreement on primary: %v and %v\n", primary, cc.primary)
-    }
-
-    if cc.view != view {
-      testing.Fatalf("Disagreement on view: %v and %v\n", view, cc.view)
-    }
+    checkView(t, cc, view, primary)
   }
 
   log.Printf("Primary %v successfully elected\n", primary)
@@ -54,7 +67,7 @@ func TestLeaderElection(testing *testing.T) {
     }
 
     if primary == -1 {
-      testing.Fatalf("No primary re-elected after %v ms\n", 2 * ELECTION_TIMEOUT_MAX)
+      t.Fatalf("No primary re-elected after %v ms\n", 2 * ELECTION_TIMEOUT_MAX)
     }
 
     for _, cc := range ccs {
@@ -62,13 +75,7 @@ func TestLeaderElection(testing *testing.T) {
         continue
       }
 
-      if cc.primary != primary {
-        testing.Fatalf("Disagreement on primary: %v and %v\n", primary, cc.primary)
-      }
-
-      if cc.view != view {
-        testing.Fatalf("Disagreement on view: %v and %v\n", view, cc.view)
-      }
+      checkView(t, cc, view, primary)
     }
 
     log.Printf("Primary %v successfully elected\n", primary)
@@ -84,19 +91,13 @@ func TestLeaderElection(testing *testing.T) {
       continue
     }
 
-    if cc.primary != primary {
-      testing.Fatalf("Primary change without majority: %v to %v\n", primary, cc.primary)
-    }
-
-    if cc.view != view {
-      testing.Fatalf("View change without majority: %v to %v\n", view, cc.view)
-    }
+    checkView(t, cc, view, primary)
   }
 
-  log.Printf("TestLeaderElection(): End\n")
+  log.Printf("\n\nTestLeaderElection(): End\n\n")
 }
 
-func checkBasicGetSetOps(testing *testing.T, client *Client) {
+func checkBasicGetSetOps(t *testing.T, client *Client) {
   client.Set("foo", "bar")
   client.Set("john", "doe")
 
@@ -105,74 +106,182 @@ func checkBasicGetSetOps(testing *testing.T, client *Client) {
 
   value, exists := client.Get("foo")
   if !(exists && value == "bar") {
-    testing.Fatalf("Incorrect value: foo -> %v, %v\n", value, exists)
+    t.Fatalf("Incorrect value: foo -> %v, %v\n", value, exists)
   }
 
   value, exists = client.Get("john")
   if !(exists && value == "doe") {
-    testing.Fatalf("Incorrect value: john -> %v, %v\n", value, exists)
+    t.Fatalf("Incorrect value: john -> %v, %v\n", value, exists)
   }
 
   value, exists = client.Get("other")
   if exists {
-    testing.Fatal("Key should not exist: other\n")
+    t.Fatal("Key should not exist: other\n")
   }
 
   value, exists = client.Get("joh")
   if exists {
-    testing.Fatal("Key should not exist: joh\n")
+    t.Fatal("Key should not exist: joh\n")
   }
 
   // case sensitive
   value, exists = client.Get("Foo")
   if exists {
-    testing.Fatal("Key should not exist: Foo\n")
+    t.Fatal("Key should not exist: Foo\n")
   }
 }
 
 // single client, single server
-func TestGetSetSingle(testing *testing.T) {
-  log.Printf("TestGetSetSingle(): Begin\n")
-
-  peers := []string{"/tmp/gss0.sock"}
-  ccs := make([]*CrowdControl, len(peers))
-
-  for i, _ := range peers {
-    cc := &CrowdControl{}
-    cc.Init(peers, i)
-    ccs[i] = cc
-  }
+func TestGetSetSingle(t *testing.T) {
+  log.Printf("\n\nTestGetSetSingle(): Begin\n\n")
+  peers, _ := makeCluster(1, "gss")
 
   var client Client
-  client.Init(peers)
+  client.Init("/tmp/gss0-client.sock", peers)
 
   // wait for leader election
   time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
 
-  checkBasicGetSetOps(testing, &client)
-  log.Printf("TestGetSetSingle(): End\n")
+  checkBasicGetSetOps(t, &client)
+  log.Printf("\n\nTestGetSetSingle(): End\n\n")
 }
 
 // multiple server, single client
-func TestGetSetMultiple(testing *testing.T) {
-  log.Printf("TestGetSetMultiple(): Begin\n")
-
-  peers := []string{"/tmp/gsm0.sock", "/tmp/gsm1.sock", "/tmp/gsm2.sock",
-    "/tmp/gsm3.sock", "/tmp/gsm4.sock"}
-  ccs := make([]*CrowdControl, len(peers))
-
-  for i, _ := range peers {
-    cc := &CrowdControl{}
-    cc.Init(peers, i)
-    ccs[i] = cc
-  }
+func TestGetSetMultiple(t *testing.T) {
+  log.Printf("\n\nTestGetSetMultiple(): Begin\n\n")
+  peers, _ := makeCluster(5, "gsm")
 
   var client Client
-  client.Init(peers)
+  client.Init("/tmp/gsm0-client.sock", peers)
 
   // wait for leader election
   time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
 
-  checkBasicGetSetOps(testing, &client)
-  log.Printf("TestGetSetMultiple(): End\n")
+  checkBasicGetSetOps(t, &client)
+  log.Printf("\n\nTestGetSetMultiple(): End\n\n")
+}
+
+func TestPrimarySelection(t *testing.T) {
+  log.Printf("\n\nTestPrimarySelection(): Begin\n\n")
+  numPeers := 5
+  peers, ccs := makeCluster(numPeers, "ps")
+
+  var client Client
+  client.Init("/tmp/ps-client.sock", peers)
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  primary := ccs[0].primary
+  view := ccs[0].view
+
+  if primary == -1 {
+    t.Fatalf("No primary elected\n")
+  }
+
+  for _, cc := range ccs {
+    checkView(t, cc, view, primary)
+  }
+
+  client.Set("lorem", "ipsum")
+
+  // partition node
+  log.Printf("partitioning node to make it stale\n")
+  staleNode := (primary + 1) % numPeers
+  for i, _ := range peers {
+    if i != staleNode {
+      ccs[staleNode].rejectConnFrom(i)
+      ccs[i].rejectConnFrom(staleNode)
+    }
+  }
+
+  // do set operation to make node stale
+  client.Set("dolor sit", "amet")
+
+  // kill primary and make nodes only respond to stale node
+  log.Printf("trying to make stale node the new primary\n")
+  ccs[primary].dead = true
+  for i, _ := range peers {
+    ccs[i].rejectConnFromAll()
+  }
+
+  for i, _ := range peers {
+    ccs[i].acceptConnFrom(staleNode)
+  }
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  // view/primary should be the same
+  for _, cc := range ccs {
+    if !cc.dead {
+      checkView(t, cc, view, primary)
+    }
+  }
+
+  // make nodes communicate with non-stale node
+  log.Printf("trying to make good node the new primary\n")
+  goodNode := (staleNode + 1) % numPeers
+  for i, _ := range peers {
+    ccs[i].rejectConnFromAll()
+  }
+
+  for i, _ := range peers {
+    ccs[i].acceptConnFrom(staleNode)
+    ccs[i].acceptConnFrom(goodNode)
+  }
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  // view/primary should update
+  primary = goodNode
+  if ccs[goodNode].view < view {
+    log.Fatalf("view did not update\n")
+  }
+  view = ccs[goodNode].view
+
+  for _, cc := range ccs {
+    if !cc.dead {
+      checkView(t, cc, view, primary)
+    }
+  }
+
+  // reset cluster
+  for i, _ := range peers {
+    ccs[i].acceptConnFromAll()
+  }
+
+  // make all nodes up-to-date
+  client.Set("consectetur", "adipiscing")
+
+  // ensure previously-stale node can now be elected
+  log.Printf("trying to make previously-stale node the new primary\n")
+  ccs[primary].dead = true
+
+  for i, _ := range peers {
+    ccs[i].rejectConnFromAll()
+  }
+
+  for i, _ := range peers {
+    ccs[i].acceptConnFrom(staleNode)
+  }
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+
+  // view/primary should update
+  primary = staleNode
+  if ccs[staleNode].view < view {
+    log.Fatalf("view did not update\n")
+  }
+  view = ccs[staleNode].view
+
+  for _, cc := range ccs {
+    if !cc.dead {
+      checkView(t, cc, view, primary)
+    }
+  }
+
+  log.Printf("\n\nTestPrimarySelection(): End\n\n")
 }
