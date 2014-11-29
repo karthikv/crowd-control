@@ -57,6 +57,7 @@ type CrowdControl struct {
   view int
   nextView int  // the next view number upon election timeout
   primary int
+  latestOp int  // used for determining up-to-dateness
 
   // leader election
   votes map[int]int  // view -> which machine this peer votes for
@@ -142,7 +143,12 @@ func (cc *CrowdControl) Heartbeat(args *HeartbeatArgs, response *HeartbeatRespon
 
     log.Printf("CC[%v] primary asserted beat %v\n", cc.me, cc.primary)
     cc.lastHeartbeat = time.Now()
-    cc.electionTimerCh <- true
+
+    // ensure electionTimerCh send is non-blocking
+    select {
+    case cc.electionTimerCh <- true:
+    default:
+    }
   }
 
   return nil
@@ -180,7 +186,11 @@ func (cc *CrowdControl) scheduleElection() {
 func (cc *CrowdControl) attemptElection_ml() {
   log.Printf("CC[%v] attempting election\n", cc.me)
   // try starting election if no initial view or if no recent heartbeat
-  args := &RequestVoteArgs{Primary: cc.me, View: cc.nextView}
+  args := &RequestVoteArgs{
+    Primary: cc.me,
+    View: cc.nextView,
+    LatestOp: cc.latestOp,
+  }
 
   numGranted := 0
   numAlreadyGranted := 0
@@ -252,7 +262,24 @@ func (cc *CrowdControl) attemptElection_ml() {
 func (cc *CrowdControl) setView_ml(view int, primary int) {
   cc.view = view
   cc.nextView = view + 1
+
   cc.primary = primary
+  cc.latestOp = 0
+
+  cc.lastHeartbeat = time.Now()
+
+  // reset election timer (non-blocking)
+  select {
+  case cc.electionTimerCh <- true:
+  default:
+  }
+
+  cc.ol = &OperationLog{}
+  cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
+
+  cc.prepped = make(map[int]bool)
+  cc.leaseUntil = time.Now()
+  cc.leases = make([]time.Time, cc.numPeers, cc.numPeers)
 }
 
 
@@ -268,14 +295,24 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
     return nil
   }
 
-  vote, ok := cc.votes[args.View]
-  if ok && vote != args.Primary {
-    response.Status = VOTE_ALREADY_GRANTED
+  vote, exists := cc.votes[args.View]
+  if exists {
+    if vote == args.Primary {
+      // vote has been granted to the requesting node
+      response.Status = VOTE_GRANTED
+    } else {
+      // vote granted to another node
+      response.Status = VOTE_ALREADY_GRANTED
+    }
   } else {
-    log.Printf("CC[%v] vote granted for %v\n", cc.me, args.Primary)
-    // TODO: extra condition if primary is up to date
-    cc.votes[args.View] = args.Primary
-    response.Status = VOTE_GRANTED
+    // only vote if other node is up-to-date
+    if cc.latestOp > args.LatestOp {
+      response.Status = VOTE_REFUSED
+    } else {
+      log.Printf("CC[%v] vote granted for %v\n", cc.me, args.Primary)
+      cc.votes[args.View] = args.Primary
+      response.Status = VOTE_GRANTED
+    }
   }
 
   return nil
@@ -722,6 +759,9 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
     cc.performOp(&args.Ops[i])
   }
 
+  // nonce is the op number
+  cc.latestOp = args.Nonce
+
   cc.prepped[args.Nonce] = true
   response.Status = PREP_SUCCESS
   return nil
@@ -798,10 +838,11 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.view = -1
   cc.nextView = 0
   cc.primary = -1
+  cc.latestOp = 0
 
   cc.votes = make(map[int]int)
   cc.lastHeartbeat = time.Now()
-  cc.electionTimerCh = make(chan bool)
+  cc.electionTimerCh = make(chan bool, 1)
 
   cc.scheduleElection()
   cc.scheduleHeartbeat()

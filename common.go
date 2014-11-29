@@ -96,6 +96,7 @@ type SetResponse struct {
 type RequestVoteArgs struct {
   View int
   Primary int
+  LatestOp int
 }
 
 type RequestVoteResponse struct {
