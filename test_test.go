@@ -93,7 +93,7 @@ func TestLeaderElection(testing *testing.T) {
     }
   }
 
-  log.Printf("Done leader test", primary)
+  log.Printf("TestLeaderElection(): End\n")
 }
 
 func checkBasicGetSetOps(testing *testing.T, client *Client) {

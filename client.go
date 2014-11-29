@@ -10,10 +10,6 @@ const (
   CLIENT_RPC_RETRIES = 3
   SET_RPCS_TIMEOUT = 30 * time.Millisecond
 
-  WAIT_TIME_INITIAL = 1 * time.Millisecond
-  WAIT_TIME_MULTIPLICATIVE_INCREASE = 2
-  WAIT_TIME_MAX = 5 * time.Second
-
   WEIGHT_MAX = 100
   WEIGHT_MIN = 10
   WEIGHT_ADDITIVE_DECREASE = -10
@@ -27,6 +23,7 @@ type Client struct {
 
   servers []string
   numServers int
+  nodes []int
 
   weights []int
   primary int
@@ -41,7 +38,7 @@ func (client *Client) Get(key string) (string, bool) {
   args := &GetArgs{Key: key}
   waitTime := WAIT_TIME_INITIAL
 
-  for {
+  for i := 0; i < CLIENT_RPC_RETRIES; i++ {
     servers := client.pickServers()
     outCh := make(chan *GetResponse, len(servers))
 
@@ -93,6 +90,9 @@ func (client *Client) Get(key string) (string, bool) {
       waitTime *= WAIT_TIME_MULTIPLICATIVE_INCREASE
     }
   }
+
+  // couldn't get response
+  return "", false
 }
 
 
@@ -136,7 +136,7 @@ func (client *Client) Set(key string, value string) {
 
   for !success {
     if client.primary == -1 {
-      ch := makeParallelRPCs(client.servers,
+      ch := makeParallelRPCs(client.nodes,
         // sends a Set RPC to the given peer
         func(node int) chan *RPCReply {
           response := &SetResponse{}
@@ -192,6 +192,11 @@ func (client *Client) Set(key string, value string) {
 func (client *Client) Init(servers []string) {
   client.servers = servers
   client.numServers = len(servers)
+
+  client.nodes = make([]int, client.numServers, client.numServers)
+  for i := 0; i < client.numServers; i++ {
+    client.nodes[i] = i
+  }
 
   client.weights = make([]int, client.numServers, client.numServers)
   for i := 0; i < client.numServers; i++ {

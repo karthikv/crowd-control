@@ -8,7 +8,17 @@ import (
 )
 
 const (
-  OK = iota
+  // time to wait for RPCs
+  RPC_TIMEOUT = 10 * time.Millisecond
+
+  // time to wait before retrying parallel RPCs
+  WAIT_TIME_INITIAL = 1 * time.Millisecond
+
+  // factor to increase wait time by to not congest network
+  WAIT_TIME_MULTIPLICATIVE_INCREASE = 2
+
+  // max wait time
+  WAIT_TIME_MAX = 5 * time.Second
 
   // get operation succeded
   GET_SUCCESS = iota
@@ -145,7 +155,15 @@ type RequestLeaseResponse struct {
 }
 
 
-const RPC_TIMEOUT = 10 * time.Millisecond
+/* The RevokeLease() RPC revokes a lease to handle get requests. */
+type RevokeLeaseArgs struct {
+  View int
+}
+
+type RevokeLeaseResponse struct {
+  Success bool
+}
+
 
 /* Makes an RPC to the given `peer`, calling the function specified by `name`.
  * Passes in the arguments `args`. Requires an allocated `response` that can
@@ -232,14 +250,14 @@ type replyRPCFn func(*RPCReply) bool
  * (c) `timeout` elapses
  */
  // TODO: make arrays pointers?
-func makeParallelRPCs(peers []string, sendCb sendRPCFn, replyCb replyRPCFn,
+func makeParallelRPCs(nodes []int, sendCb sendRPCFn, replyCb replyRPCFn,
     timeout time.Duration) chan []*RPCReply {
-  numPeers := len(peers)
+  numNodes := len(nodes)
   doneCh := make(chan bool)
-  replyCh := make(chan *RPCReply, numPeers)
+  replyCh := make(chan *RPCReply, numNodes)
 
   // send RPCs
-  for i, _ := range peers {
+  for _, node := range nodes {
     go func(node int) {
       ch := sendCb(node)
       select {
@@ -248,15 +266,15 @@ func makeParallelRPCs(peers []string, sendCb sendRPCFn, replyCb replyRPCFn,
       case <-doneCh:
         return
       }
-    }(i)
+    }(node)
   }
 
   // collect results, appending them to an array
-  replies := make([]*RPCReply, 0, numPeers)
+  replies := make([]*RPCReply, 0, numNodes)
   processedCh := make(chan bool)
 
   go func() {
-    for i := 0; i < numPeers; i += 1 {
+    for i := 0; i < numNodes; i += 1 {
       select {
       case reply := <-replyCh:
         stop := replyCb(reply)
