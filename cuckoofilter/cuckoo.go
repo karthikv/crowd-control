@@ -3,13 +3,12 @@ import (
   "errors"
   "crypto/sha256"
   "math/rand"
-  // "fmt"
   "math/big"
 )
 // Constants
 const (
   BUCKET_SIZE = 4
-  MAX_DISPLACEMENTS = 100
+  MAX_DISPLACEMENTS = 500
 )
 // Data structures to implement the cuckoo filter
 type CuckooFilter struct {
@@ -53,15 +52,13 @@ func xor(a, b []byte) []byte {
   return result
 }
 
-func xorAllBytes(a []byte) uint16 {
-  var result uint16
-  result = uint16(a[0]) << 8
-  result = result | uint16(a[1])
-  for i := 2; i < len(a); i++ {
-    result = result ^ uint16(a[i])
-  }
+func getFingerprint(a []byte) uint16 {
+  xor := new(big.Int)
+  xor.SetBytes(a)
+  result := uint16(xor.Uint64() >> 48)
   return result
 }
+
 /**** To instantiate a new cuckoo filter, call this *****/
 func Make(size int) (*CuckooFilter, error) {
   if size <= 0 {
@@ -128,9 +125,11 @@ func (cf *CuckooFilter) calculateIndices(checksum []byte, fingerprint uint16) (u
 
 // This function returns a triplet: true or false if the key/fingerprint is in the filter, the bucket index and the index of the fingerprint within the bucket.
 func (cf *CuckooFilter) contains(key string) (bool, uint64, int) {
+
   checksum := hash(key)
-  fingerprint := xorAllBytes(checksum)
+  fingerprint := getFingerprint(checksum)
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
+ 
   fingerprintIndex, present := cf.search(firstIndex, fingerprint)
   if present {
     return true, firstIndex, fingerprintIndex
@@ -146,6 +145,7 @@ func (cf *CuckooFilter) contains(key string) (bool, uint64, int) {
 // Search bucket for fingerprint. Returns (index, present). If not found, present is false
 func (cf *CuckooFilter) search(index uint64, fingerprint uint16) (int, bool){
   currBucket := &cf.hashtable[index]
+ 
   i := uint8(0)
   for i = 0; i < currBucket.numElements; i++ {
     if currBucket.fingerprints[i] == fingerprint {
@@ -158,6 +158,7 @@ func (cf *CuckooFilter) search(index uint64, fingerprint uint16) (int, bool){
 func (cf *CuckooFilter) deleteEntry(bucketIndex uint64, entryIndex int) {
   currBucket := &cf.hashtable[bucketIndex]
   fingerprints := &currBucket.fingerprints
+ 
   fingerprints[entryIndex] = fingerprints[currBucket.numElements - 1]
   currBucket.numElements--
 }
@@ -168,13 +169,14 @@ func (cf *CuckooFilter) Add(key string) bool {
   // TODO: Initialize random generator
   // 8-byte SHA checksum of the key
   if cf.Contains(key) {
-    return false
+    return true
   }
   checksum := hash(key)
   // Calculate the fingerprint: pick highest byte from the checksum
-  fingerprint := xorAllBytes(checksum)
+  fingerprint := getFingerprint(checksum)
   // find indices of the fingerprint in the filter
   firstIndex, secondIndex := cf.calculateIndices(checksum, fingerprint)
+
   // Try to insert at first index
   tryFirst := cf.insert(firstIndex, fingerprint)
   if !tryFirst {
@@ -193,6 +195,7 @@ func (cf *CuckooFilter) Add(key string) bool {
 
 func (cf *CuckooFilter) Delete(key string) {
   present, index, fingerprintIndex := cf.contains(key)
+
   if present {
     cf.deleteEntry(index, fingerprintIndex)
   }
