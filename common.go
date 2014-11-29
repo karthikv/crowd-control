@@ -58,6 +58,21 @@ const (
 
   // lease refused, as there's a later view
   LEASE_REFUSED = iota
+
+  // fetch kv-pair from primary is successful, returns a more up-to-date value
+  FETCH_SUCCESS = iota
+
+  // successfully requested kv-pair from primary
+  REQUEST_KV_PAIR_SUCCESS = iota
+
+  // request was refused because primary was in a different view
+  REQUEST_KV_PAIR_REFUSED = iota
+
+  // requester successfully updated the kv-pair in its local cache
+  SEND_KV_PAIR_SUCCESS = iota
+
+  // requester could not perform the update since it is in a different view
+  SEND_KV_PAIR_REFUSED = iota
 )
 
 
@@ -155,6 +170,28 @@ type RequestLeaseResponse struct {
   Until time.Time
 }
 
+/* The RequestKVPair() RPC requests a key-value pair from the primary */
+type RequestKVPairArgs struct {
+  View int
+  Node int
+  Key string
+}
+
+type RequestKVPairResponse struct {
+  Status byte
+}
+
+/* The SendKVPair() RPC sends a key-value pair from the primary to the requesting node */
+type SendKVPairArgs struct {
+  View int
+  Exists bool
+  Key string
+  Value string
+}
+
+type SendKVPairResponse struct {
+  Status byte
+}
 
 /* The RevokeLease() RPC revokes a lease to handle get requests. */
 type RevokeLeaseArgs struct {

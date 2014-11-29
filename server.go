@@ -23,6 +23,8 @@ const (
 
   SERVER_RPC_RETRIES = 3
   OP_LOG_CAPACITY = 256
+
+  REQUEST_KV_PAIR_TIMEOUT = 50 * time.Millisecond
 )
 
 
@@ -84,6 +86,9 @@ type CrowdControl struct {
 
   // leases granted by primary to nodes; node -> lease expiry mapping
   leases []time.Time
+
+  // mapping from keys to the time when request for fetch for kv pair from primary was made
+  inflightKeys map[string]time.Time
 }
 
 
@@ -318,7 +323,6 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
   return nil
 }
 
-
 func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
@@ -365,15 +369,126 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   if cc.filters[cc.me][args.Key] {
     // not up-to-date for this key
     response.Status = GET_DELAYED
-    // TODO: ask other server for k/v pair
+
+    if cc.me != cc.primary {
+      // request the key value pair from the primary
+      cc.getKVPairFromPrimary(args.Key)
+    }
   } else {
     response.Status = GET_SUCCESS
     response.Value, response.Exists = cc.cache[args.Key]
   }
-
   return nil
 }
 
+
+func (cc *CrowdControl) getKVPairFromPrimary(key string) {
+  // TODO: garbage collect inflight keys
+  cc.mutex.Lock()
+  lastTime, exists := cc.inflightKeys[key]
+  if !exists || time.Now().Sub(lastTime) >= REQUEST_KV_PAIR_TIMEOUT {
+    
+    cc.inflightKeys[key] = time.Now()
+    go func() {
+      args := &RequestKVPairArgs{
+        View: cc.view,
+        Node: cc.me,
+        Key: key, 
+      }
+      ch := makeRPCRetry(cc.peers[cc.primary], cc.primary, "CrowdControl.RequestKVPair", &args, &RequestKVPairResponse{}, SERVER_RPC_RETRIES)
+      reply := <-ch
+      cc.mutex.Lock()
+      defer cc.mutex.Unlock()
+      if reply.Success {
+        response := reply.Data.(*RequestKVPairResponse)
+        // if the primary refused to provide the value b/c its in a diff view
+        if response.Status == REQUEST_KV_PAIR_REFUSED {
+          delete(cc.inflightKeys, args.Key)
+        }
+      } else {
+        delete(cc.inflightKeys, args.Key)
+      }
+    }()
+  }
+  cc.mutex.Unlock()
+}
+
+func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs, response *RequestKVPairResponse) error {
+  cc.mutex.Lock()
+  if (cc.view != args.View) {
+    response.Status = REQUEST_KV_PAIR_REFUSED
+    cc.mutex.Unlock()
+    return nil
+  }
+  cc.mutex.Unlock()
+  // TODO: what are the other cases in which a refusal should happen?
+  response.Status = REQUEST_KV_PAIR_SUCCESS
+  
+  // these fetches should only execute on primary
+  if cc.me == cc.primary {
+
+    go func() {
+      val, exists := cc.cache[args.Key]
+      originalView := cc.view
+      sendArgs := &SendKVPairArgs{
+        View: cc.view,
+        Key: args.Key,
+        Value: val,
+        Exists: exists,
+      }
+      ch := makeRPCRetry(cc.peers[args.Node], args.Node, "CrowdControl.ReceiveKVPair", &sendArgs, &SendKVPairResponse{}, SERVER_RPC_RETRIES)
+      reply := <-ch
+
+      cc.mutex.Lock()
+      defer cc.mutex.Unlock()
+      
+      if cc.view != originalView {
+        return
+      }
+      
+      if reply.Success {
+        sendResponse := reply.Data.(*SendKVPairResponse)
+        if sendResponse.Status == SEND_KV_PAIR_SUCCESS {
+          // delete from nodes filter; append to operation log
+          delete(cc.filters[args.Node], args.Key)
+          nodes := []int{args.Node}
+          op := &Operation{
+            Add: false,
+            Key: args.Key,
+            Nodes: nodes,
+          }
+          cc.ol.Append(op)
+        }
+      }
+
+    }()
+  }
+  return nil
+}
+
+
+func (cc *CrowdControl) ReceiveKVPair(args *SendKVPairArgs, response *SendKVPairResponse) error {
+  cc.mutex.Lock()
+  if (cc.view != args.View) {
+    response.Status = SEND_KV_PAIR_REFUSED
+    cc.mutex.Unlock()
+    return nil
+  }
+  cc.mutex.Unlock()
+  response.Status = SEND_KV_PAIR_SUCCESS
+  // TODO: what are the other failure cases here?
+
+  cc.mutex.Lock()
+  defer cc.mutex.Unlock()
+  if (!args.Exists) {
+    delete(cc.cache, args.Key)
+  } else {
+    cc.cache[args.Key] = args.Value
+  }
+  delete(cc.filters[cc.me], args.Key)
+  delete(cc.inflightKeys, args.Key)
+  return nil
+}
 
 func (cc *CrowdControl) hashFilter(filter map[string]bool) [sha256.Size]byte {
   numBytes := 0
@@ -862,6 +977,8 @@ func (cc *CrowdControl) Init(peers []string, me int) {
 
   cc.leaseUntil = time.Now()
   cc.leases = make([]time.Time, cc.numPeers, cc.numPeers)
+
+  cc.inflightKeys = make(map[string]time.Time)
 
   for i := 0; i < cc.numPeers; i++ {
     cc.leases[i] = time.Now()
