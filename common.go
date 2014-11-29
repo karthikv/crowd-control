@@ -62,9 +62,6 @@ const (
   // lease refused, as there's a later view
   LEASE_REFUSED = iota
 
-  // fetch kv-pair from primary is successful, returns a more up-to-date value
-  FETCH_SUCCESS = iota
-
   // successfully requested kv-pair from primary
   REQUEST_KV_PAIR_SUCCESS = iota
 
@@ -188,6 +185,7 @@ type RequestKVPairResponse struct {
 /* The SendKVPair() RPC sends a key-value pair from the primary to the requesting node */
 type SendKVPairArgs struct {
   View int
+  Node int
   Exists bool
   Key string
   Value string

@@ -388,23 +388,31 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
 func (cc *CrowdControl) getKVPairFromPrimary(key string) {
   // TODO: garbage collect inflight keys
   cc.mutex.Lock()
+  defer cc.mutex.Unlock()
+
   lastTime, exists := cc.inflightKeys[key]
   if !exists || time.Now().Sub(lastTime) >= REQUEST_KV_PAIR_TIMEOUT {
-    
     cc.inflightKeys[key] = time.Now()
+
     go func() {
       args := &RequestKVPairArgs{
         View: cc.view,
         Node: cc.me,
-        Key: key, 
+        Key: key,
       }
-      ch := makeRPCRetry(cc.peers[cc.primary], cc.primary, "CrowdControl.RequestKVPair", &args, &RequestKVPairResponse{}, SERVER_RPC_RETRIES)
+
+      ch := makeRPCRetry(cc.peers[cc.me], cc.peers[cc.primary], cc.primary,
+        "CrowdControl.RequestKVPair", &args, &RequestKVPairResponse{},
+        SERVER_RPC_RETRIES)
       reply := <-ch
+
       cc.mutex.Lock()
       defer cc.mutex.Unlock()
+
       if reply.Success {
         response := reply.Data.(*RequestKVPairResponse)
-        // if the primary refused to provide the value b/c its in a diff view
+
+        // primary refused to provide the value; it's in a different view
         if response.Status == REQUEST_KV_PAIR_REFUSED {
           delete(cc.inflightKeys, args.Key)
         }
@@ -413,83 +421,107 @@ func (cc *CrowdControl) getKVPairFromPrimary(key string) {
       }
     }()
   }
-  cc.mutex.Unlock()
 }
 
-func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs, response *RequestKVPairResponse) error {
+func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
+    response *RequestKVPairResponse) error {
   cc.mutex.Lock()
-  if (cc.view != args.View) {
+  defer cc.mutex.Unlock()
+
+  if cc.view != args.View || cc.me != cc.primary {
     response.Status = REQUEST_KV_PAIR_REFUSED
-    cc.mutex.Unlock()
     return nil
   }
-  cc.mutex.Unlock()
   // TODO: what are the other cases in which a refusal should happen?
+
   response.Status = REQUEST_KV_PAIR_SUCCESS
-  
-  // these fetches should only execute on primary
-  if cc.me == cc.primary {
+  go func() {
+    cc.mutex.Lock()
+    var value string
+    var exists bool
 
-    go func() {
-      val, exists := cc.cache[args.Key]
-      originalView := cc.view
-      sendArgs := &SendKVPairArgs{
-        View: cc.view,
+    if cc.filters[cc.me][args.Key] {
+      value, exists = "", false
+      delete(cc.cache, args.Key)
+      delete(cc.filters[cc.me], args.Key)
+
+      // TODO: does this cause too many ops to be added? why not just recover?
+      op := &Operation{
+        Add: false,
         Key: args.Key,
-        Value: val,
-        Exists: exists,
+        Nodes: []int{cc.me},
       }
-      ch := makeRPCRetry(cc.peers[args.Node], args.Node, "CrowdControl.ReceiveKVPair", &sendArgs, &SendKVPairResponse{}, SERVER_RPC_RETRIES)
-      reply := <-ch
+      cc.ol.Append(op)
+    } else {
+      value, exists = cc.cache[args.Key]
+    }
 
-      cc.mutex.Lock()
-      defer cc.mutex.Unlock()
-      
-      if cc.view != originalView {
-        return
-      }
-      
-      if reply.Success {
-        sendResponse := reply.Data.(*SendKVPairResponse)
-        if sendResponse.Status == SEND_KV_PAIR_SUCCESS {
-          // delete from nodes filter; append to operation log
-          delete(cc.filters[args.Node], args.Key)
-          nodes := []int{args.Node}
-          op := &Operation{
-            Add: false,
-            Key: args.Key,
-            Nodes: nodes,
-          }
-          cc.ol.Append(op)
+    sendArgs := &SendKVPairArgs{
+      View: cc.view,
+      Node: cc.me,
+      Key: args.Key,
+      Value: value,
+      Exists: exists,
+    }
+
+    ch := makeRPCRetry(cc.peers[cc.me], cc.peers[args.Node], args.Node,
+      "CrowdControl.SendKVPair", &sendArgs, &SendKVPairResponse{},
+      SERVER_RPC_RETRIES)
+
+    originalView := cc.view
+    cc.mutex.Unlock()
+
+    reply := <-ch
+
+    cc.mutex.Lock()
+    defer cc.mutex.Unlock()
+
+    if cc.view != originalView {
+      return
+    }
+
+    if reply.Success {
+      sendResponse := reply.Data.(*SendKVPairResponse)
+
+      if sendResponse.Status == SEND_KV_PAIR_SUCCESS {
+        // delete from node's filter; append to operation log
+        delete(cc.filters[args.Node], args.Key)
+
+        op := &Operation{
+          Add: false,
+          Key: args.Key,
+          Nodes: []int{args.Node},
         }
+        cc.ol.Append(op)
       }
+    }
+  }()
 
-    }()
-  }
   return nil
 }
 
 
-func (cc *CrowdControl) ReceiveKVPair(args *SendKVPairArgs, response *SendKVPairResponse) error {
-  cc.mutex.Lock()
-  if (cc.view != args.View) {
-    response.Status = SEND_KV_PAIR_REFUSED
-    cc.mutex.Unlock()
-    return nil
-  }
-  cc.mutex.Unlock()
-  response.Status = SEND_KV_PAIR_SUCCESS
-  // TODO: what are the other failure cases here?
-
+func (cc *CrowdControl) SendKVPair(args *SendKVPairArgs,
+    response *SendKVPairResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
-  if (!args.Exists) {
+
+  if cc.view != args.View || cc.primary != args.Node {
+    response.Status = SEND_KV_PAIR_REFUSED
+    return nil
+  }
+  // TODO: what are the other failure cases here?
+
+  if !args.Exists {
     delete(cc.cache, args.Key)
   } else {
     cc.cache[args.Key] = args.Value
   }
+
   delete(cc.filters[cc.me], args.Key)
   delete(cc.inflightKeys, args.Key)
+
+  response.Status = SEND_KV_PAIR_SUCCESS
   return nil
 }
 
