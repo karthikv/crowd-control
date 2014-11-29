@@ -150,7 +150,7 @@ const RPC_TIMEOUT = 10 * time.Millisecond
 /* Makes an RPC to the given `peer`, calling the function specified by `name`.
  * Passes in the arguments `args`. Requires an allocated `response` that can
  * hold the reply data. Returns a channel that holds the reply. */
-func makeRPC(peer string, node int, name string, args interface{}, 
+func makeRPC(peer string, node int, name string, args interface{},
     response interface{}) chan *RPCReply {
   rpcCh := make(chan *RPCReply, 1)
 

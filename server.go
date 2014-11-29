@@ -195,6 +195,9 @@ func (cc *CrowdControl) attemptElection_ml() {
 
     // aggregates RequestVote replies; determines when to stop collecting them
     func(reply *RPCReply) bool {
+      cc.mutex.Lock()
+      defer cc.mutex.Unlock()
+
       if reply.Success {
         // compute number of granted and already granted votes
         voteResponse := reply.Data.(*RequestVoteResponse)
@@ -445,6 +448,9 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
       // aggregates Prep replies; determines when to stop collecting them
       func(reply *RPCReply) bool {
+        cc.mutex.Lock()
+        defer cc.mutex.Unlock()
+
         if reply.Success {
           // compute number of granted and already granted votes
           prepResponse := reply.Data.(*PrepResponse)
@@ -514,16 +520,15 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
       // aggregates Commit replies; determines when to stop collecting them
       func(reply *RPCReply) bool {
+        cc.mutex.Lock()
+        defer cc.mutex.Unlock()
+        // note: view change doesn't compromise safety here
+
         if reply.Success {
           // compute number of granted and already granted votes
           commitResponse := reply.Data.(*CommitResponse)
           if commitResponse.Success {
-            // possible view change; reply handlers can happen without lock
-            cc.mutex.Lock()
-            if cc.view == originalView {
-              delete(cc.filters[reply.Node], key)
-            }
-            cc.mutex.Unlock()
+            delete(cc.filters[reply.Node], key)
             committedNodes = append(committedNodes, reply.Node)
           }
         }

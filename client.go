@@ -3,18 +3,34 @@ package cc
 import (
   "time"
   "sync"
+  "math/rand"
 )
-
-type Client struct {
-  mutex sync.Mutex
-  servers []string
-  primary int
-}
 
 const (
   CLIENT_RPC_RETRIES = 3
-  SET_RPCS_TIMEOUT = 50 * time.Millisecond
+  SET_RPCS_TIMEOUT = 30 * time.Millisecond
+
+  WAIT_TIME_INITIAL = 1 * time.Millisecond
+  WAIT_TIME_MULTIPLICATIVE_INCREASE = 2
+  WAIT_TIME_MAX = 5 * time.Second
+
+  WEIGHT_MAX = 100
+  WEIGHT_MIN = 10
+  WEIGHT_ADDITIVE_DECREASE = -10
+  WEIGHT_MULTIPLICATIVE_FACTOR = 2
 )
+
+
+type Client struct {
+  mutex sync.Mutex
+  weightMutex sync.Mutex
+
+  servers []string
+  numServers int
+
+  weights []int
+  primary int
+}
 
 
 func (client *Client) Get(key string) (string, bool) {
@@ -23,30 +39,90 @@ func (client *Client) Get(key string) (string, bool) {
 
   // TODO: try different servers
   args := &GetArgs{Key: key}
-  response := &GetResponse{}
-  waitTime := 10 * time.Millisecond
-
-  lastServer := len(client.servers) - 1
+  waitTime := WAIT_TIME_INITIAL
 
   for {
-    ch := makeRPCRetry(client.servers[lastServer], lastServer, "CrowdControl.Get", args, response,
-      CLIENT_RPC_RETRIES)
-    reply := <-ch
+    servers := client.pickServers()
+    outCh := make(chan *GetResponse, len(servers))
 
-    if reply.Success {
-      getResponse := reply.Data.(*GetResponse)
+    for i, _ := range servers {
+      go func(i int) {
+        ch := makeRPC(client.servers[i], i, "CrowdControl.Get", args, &GetResponse{})
+        reply := <-ch
 
-      if getResponse.Status == GET_SUCCESS {
-        return getResponse.Value, getResponse.Exists
-      }
+        if reply.Success {
+          getResponse := reply.Data.(*GetResponse)
+          if getResponse.Status == GET_SUCCESS {
+            outCh <- getResponse
+          }
+        }
+
+        client.weightMutex.Lock()
+        defer client.weightMutex.Unlock()
+
+        if reply.Success {
+          getResponse := reply.Data.(*GetResponse)
+          if getResponse.Status == GET_SUCCESS {
+            client.weights[i] *= WEIGHT_MULTIPLICATIVE_FACTOR
+          } else {
+            client.weights[i] += WEIGHT_ADDITIVE_DECREASE
+          }
+        } else {
+          client.weights[i] /= WEIGHT_MULTIPLICATIVE_FACTOR
+        }
+
+        if client.weights[i] < WEIGHT_MIN {
+          client.weights[i] = WEIGHT_MIN
+        }
+
+        if client.weights[i] > WEIGHT_MAX {
+          client.weights[i] = WEIGHT_MAX
+        }
+      }(i)
+    }
+
+    select {
+    case response := <-outCh:
+      return response.Value, response.Exists
+    case <-time.After(RPC_TIMEOUT):
     }
 
     // throttle requests
     time.Sleep(waitTime)
-    if waitTime < 10 * time.Second {
-      waitTime *= 2
+    if waitTime < WAIT_TIME_MAX {
+      waitTime *= WAIT_TIME_MULTIPLICATIVE_INCREASE
     }
   }
+}
+
+
+func (client *Client) pickServers() []string {
+  // pick a majority of servers to contact
+  numChosen := client.numServers / 2 + 1
+  servers := make([]string, numChosen, numChosen)
+
+  client.weightMutex.Lock()
+  defer client.weightMutex.Unlock()
+
+  totalWeight := 0
+  for _, weight := range client.weights {
+    totalWeight += weight
+  }
+
+  for i := 0; i < numChosen; i++ {
+    randWeight := rand.Int() % totalWeight
+    cumWeight := 0
+
+    for j, weight := range client.weights {
+      cumWeight += weight
+      if randWeight < cumWeight {
+        servers[i] = client.servers[j]
+        break
+      }
+    }
+  }
+
+  return servers
 }
 
 
@@ -56,7 +132,7 @@ func (client *Client) Set(key string, value string) {
 
   args := &SetArgs{Key: key, Value: value}
   success := false
-  waitTime := 10 * time.Millisecond
+  waitTime := WAIT_TIME_INITIAL
 
   for !success {
     if client.primary == -1 {
@@ -106,9 +182,8 @@ func (client *Client) Set(key string, value string) {
     // throttle requests
     if !success {
       time.Sleep(waitTime)
-
-      if waitTime < 10 * time.Second {
-        waitTime *= 2
+      if waitTime < WAIT_TIME_MAX {
+        waitTime *= WAIT_TIME_MULTIPLICATIVE_INCREASE
       }
     }
   }
@@ -116,5 +191,12 @@ func (client *Client) Set(key string, value string) {
 
 func (client *Client) Init(servers []string) {
   client.servers = servers
+  client.numServers = len(servers)
+
+  client.weights = make([]int, client.numServers, client.numServers)
+  for i := 0; i < client.numServers; i++ {
+    client.weights[i] = WEIGHT_MAX
+  }
+
   client.primary = -1
 }
