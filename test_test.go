@@ -236,7 +236,7 @@ func checkBasicGetSetOps(t *testing.T, client *Client) {
   client.Set("john", "doe")
 
   // wait for values to propagate
-  time.Sleep(100 * time.Microsecond)
+  time.Sleep(COMMIT_RPCS_TIMEOUT)
 
   value, exists := client.Get("foo")
   if !(exists && value == "bar") {
