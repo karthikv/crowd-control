@@ -14,17 +14,40 @@ import (
 )
 
 const (
+  // min/max time until election
   ELECTION_TIMEOUT_MIN = 150
   ELECTION_TIMEOUT_MAX = 300
   ELECTION_RPCS_TIMEOUT = 100 * time.Millisecond
 
+  // time between heartbeats
   HEARTBEAT_TIMEOUT = 25 * time.Millisecond
+
+  // time to wait for heartbeat responses
+  HEARTBEAT_RPCS_TIMEOUT = HEARTBEAT_TIMEOUT
+
+  // time to wait for prep responses
+  PREP_RPCS_TIMEOUT = 50 * time.Millisecond
+
+  // time to wait for commit responses
+  COMMIT_RPCS_TIMEOUT = PREP_RPCS_TIMEOUT
+
+  // time to wait for revoke lease responses
+  REVOKE_LEASE_RPCS_TIMEOUT = 1 * time.Second
+
+  // timeout for request operation
+  REQUEST_KV_PAIR_TIMEOUT = COMMIT_RPCS_TIMEOUT
+
+  // length of lease
   LEASE_DURATION = 10 * time.Second
 
+  // number of times to retry RPCs
   SERVER_RPC_RETRIES = 3
+
+  // max length of operation log
   OP_LOG_CAPACITY = 256
 
-  REQUEST_KV_PAIR_TIMEOUT = 50 * time.Millisecond
+  // error messages
+  GET_LEASE_ERROR_MESSAGE = "could not get lease"
 )
 
 
@@ -131,7 +154,7 @@ func (cc *CrowdControl) sendHeartbeat_ml() {
     // handles a Heartbeat response
     func(reply *RPCReply) bool {
       return false
-    }, HEARTBEAT_TIMEOUT)
+    }, HEARTBEAT_RPCS_TIMEOUT)
 }
 
 
@@ -353,18 +376,15 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
 
         // TODO: case where filter is too full; need to recover?
         if leaseResponse.Status == LEASE_GRANTED {
-          log.Printf("got granted for req lease\n")
           cc.leaseUntil = leaseResponse.Until
         } else if leaseResponse.Status == LEASE_REFUSED {
-          log.Printf("got refused for req lease\n")
           return errors.New("get aborted due to view change")
         } else if leaseResponse.Status == LEASE_UPDATE_FILTER {
-          log.Printf("got update for req lease\n")
           cc.filters[cc.me] = leaseResponse.Filter
           cc.leaseUntil = leaseResponse.Until
         }
       } else {
-        return errors.New("could not get lease")
+        return errors.New(GET_LEASE_ERROR_MESSAGE)
       }
     }
   }
@@ -375,12 +395,13 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
 
     if cc.me != cc.primary {
       // request the key value pair from the primary
-      cc.getKVPairFromPrimary(args.Key)
+      go cc.getKVPairFromPrimary(args.Key)
     }
   } else {
     response.Status = GET_SUCCESS
     response.Value, response.Exists = cc.cache[args.Key]
   }
+
   return nil
 }
 
@@ -388,38 +409,45 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
 func (cc *CrowdControl) getKVPairFromPrimary(key string) {
   // TODO: garbage collect inflight keys
   cc.mutex.Lock()
-  defer cc.mutex.Unlock()
+  shouldRequestPair := false
 
-  lastTime, exists := cc.inflightKeys[key]
-  if !exists || time.Now().Sub(lastTime) >= REQUEST_KV_PAIR_TIMEOUT {
+  lastRequest, exists := cc.inflightKeys[key]
+  if !exists || time.Now().Sub(lastRequest) >= REQUEST_KV_PAIR_TIMEOUT {
     cc.inflightKeys[key] = time.Now()
+    shouldRequestPair = true
+  }
 
-    go func() {
-      args := &RequestKVPairArgs{
-        View: cc.view,
-        Node: cc.me,
-        Key: key,
-      }
+  args := &RequestKVPairArgs{
+    View: cc.view,
+    Node: cc.me,
+    Key: key,
+  }
 
-      ch := makeRPCRetry(cc.peers[cc.me], cc.peers[cc.primary], cc.primary,
-        "CrowdControl.RequestKVPair", &args, &RequestKVPairResponse{},
-        SERVER_RPC_RETRIES)
-      reply := <-ch
+  peerMe := cc.peers[cc.me]
+  primary := cc.primary
+  peerPrimary := cc.peers[primary]
 
-      cc.mutex.Lock()
-      defer cc.mutex.Unlock()
+  cc.mutex.Unlock()
 
-      if reply.Success {
-        response := reply.Data.(*RequestKVPairResponse)
+  if shouldRequestPair {
+    ch := makeRPCRetry(peerMe, peerPrimary, primary, "CrowdControl.RequestKVPair",
+      &args, &RequestKVPairResponse{}, SERVER_RPC_RETRIES)
+    reply := <-ch
 
-        // primary refused to provide the value; it's in a different view
-        if response.Status == REQUEST_KV_PAIR_REFUSED {
-          delete(cc.inflightKeys, args.Key)
-        }
-      } else {
+    cc.mutex.Lock()
+
+    if reply.Success {
+      response := reply.Data.(*RequestKVPairResponse)
+
+      // primary refused to provide the value; it's in a different view
+      if response.Status == REQUEST_KV_PAIR_REFUSED {
         delete(cc.inflightKeys, args.Key)
       }
-    }()
+    } else {
+      delete(cc.inflightKeys, args.Key)
+    }
+
+    cc.mutex.Unlock()
   }
 }
 
@@ -651,8 +679,9 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         args := &PrepArgs{
           View: cc.view,
           Invalid: invalid,
-          Ops: ops,
           Nonce: nonce,
+          Key: key,
+          Ops: ops,
         }
 
         return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
@@ -682,7 +711,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           }
         }
         return false
-      }, ELECTION_RPCS_TIMEOUT)
+      }, PREP_RPCS_TIMEOUT)
 
 
     originalView := cc.view
@@ -756,7 +785,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           }
         }
         return false
-      }, ELECTION_RPCS_TIMEOUT)
+      }, COMMIT_RPCS_TIMEOUT)
 
     cc.mutex.Unlock()
 
@@ -831,7 +860,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         }
 
         return false
-      }, HEARTBEAT_TIMEOUT)
+      }, REVOKE_LEASE_RPCS_TIMEOUT)
 
     select {
     case <-leasesRevokedCh:
@@ -909,6 +938,10 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
   for i := 0; i < numOps; i++ {
     cc.performOp(&args.Ops[i])
   }
+
+  // key will take time to commit; don't allow an incoming get request to
+  // trigger a RequestKVPair() RPC
+  cc.inflightKeys[args.Key] = time.Now()
 
   // nonce is the op number
   cc.latestOp = args.Nonce

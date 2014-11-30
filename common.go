@@ -135,6 +135,7 @@ type PrepArgs struct {
   View int
   Invalid bool
   Nonce int
+  Key string
   Ops []Operation
 }
 
@@ -228,6 +229,7 @@ func makeRPC(sender string, receiver string, receiverNode int, name string,
       return
     }
 
+    // TODO: need a better way to determine sender
     os.Remove(sender)
     d.LocalAddr = senderAddr
     unixConn, err := d.Dial("unix", receiver)
