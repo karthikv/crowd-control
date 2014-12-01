@@ -989,6 +989,9 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
     return nil
   }
 
+  // KV pair has been received 
+  delete(cc.inflightKeys, args.Key)
+
   cc.cache[args.Key] = args.Value
   delete(cc.filters[cc.me], args.Key)
   // TODO: Need to garbage collect prepped somehow. We can't just delete
