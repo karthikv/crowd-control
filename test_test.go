@@ -6,9 +6,13 @@ import (
   "testing"
   "time"
   "sync"
+  "math/rand"
 )
 
 func makeCluster(numPeers int, prefix string) ([]string, []*CrowdControl) {
+  // cluster uses randomness for elections
+  rand.Seed(time.Now().UnixNano())
+
   peers := make([]string, numPeers, numPeers)
   for i := 0; i < numPeers; i++ {
     peers[i] = fmt.Sprintf("/tmp/%v%v.sock", prefix, i)
