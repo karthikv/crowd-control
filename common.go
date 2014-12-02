@@ -127,6 +127,7 @@ type HeartbeatArgs struct {
 }
 
 type HeartbeatResponse struct {
+  Success bool
 }
 
 

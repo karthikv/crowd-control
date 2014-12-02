@@ -15,12 +15,16 @@ import (
 
 const (
   // min/max time until election
-  ELECTION_TIMEOUT_MIN = 150
-  ELECTION_TIMEOUT_MAX = 300
+  ELECTION_TIMEOUT_MIN_INT = 150
+  ELECTION_TIMEOUT_MIN = ELECTION_TIMEOUT_MIN_INT * time.Millisecond
+  ELECTION_TIMEOUT_MAX_INT = 300
+  ELECTION_TIMEOUT_MAX = ELECTION_TIMEOUT_MAX_INT * time.Millisecond
+
+  // time to wait before starting election
   ELECTION_RPCS_TIMEOUT = 100 * time.Millisecond
 
   // time between heartbeats
-  HEARTBEAT_TIMEOUT = 25 * time.Millisecond
+  HEARTBEAT_TIMEOUT = 20 * time.Millisecond
 
   // time to wait for heartbeat responses
   HEARTBEAT_RPCS_TIMEOUT = HEARTBEAT_TIMEOUT
@@ -31,13 +35,15 @@ const (
   // time to wait for commit responses
   COMMIT_RPCS_TIMEOUT = PREP_RPCS_TIMEOUT
 
-  // time to wait for revoke lease responses
-  REVOKE_LEASE_RPCS_TIMEOUT = 1 * time.Second
+  // Time to wait for revoke lease responses. If we can't revoke leases, we
+  // likely can't heartbeat either. After ELECTION_TIMEOUT_MAX, other nodes
+  // will start an election, clearing their leases.
+  REVOKE_LEASE_RPCS_TIMEOUT = ELECTION_TIMEOUT_MAX
 
   // timeout for request operation
   REQUEST_KV_PAIR_TIMEOUT = COMMIT_RPCS_TIMEOUT
 
-  // length of lease
+  // length of get lease
   LEASE_DURATION = 10 * time.Second
 
   // number of times to retry RPCs
@@ -107,11 +113,14 @@ type CrowdControl struct {
   // if we've prepped for a given nonce; nonce -> status mapping
   prepped map[int]bool
 
+  // last time the primary reached a majority of nodes
+  reachedMajorityAt time.Time
+
   // lease to respond to get requests
   leaseUntil time.Time
 
   // leases granted by primary to nodes; node -> lease expiry mapping
-  leases []time.Time
+  grantedLeasesUntil []time.Time
 
   // mapping from keys to the time when request for fetch for kv pair from primary was made
   inflightKeys map[string]time.Time
@@ -142,19 +151,61 @@ func (cc *CrowdControl) scheduleHeartbeat() {
 func (cc *CrowdControl) sendHeartbeat_ml() {
   // log.Printf("CC[%v] sending heartbeats\n", cc.me)
   args := &HeartbeatArgs{Primary: cc.primary, View: cc.view}
+  numReached := 0
 
-  makeParallelRPCs(cc.nodes,
+  rpcCh := makeParallelRPCs(cc.nodes,
     // sends a Heartbeat RPC to the given peer
     func(node int) chan *RPCReply {
       response := &HeartbeatResponse{}
       return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-        "CrowdControl.Heartbeat", args, response, SERVER_RPC_RETRIES)
+        "CrowdControl.Heartbeat", args, response,
+        int(HEARTBEAT_RPCS_TIMEOUT / RPC_TIMEOUT))
     },
 
     // handles a Heartbeat response
     func(reply *RPCReply) bool {
+      cc.mutex.Lock()
+      defer cc.mutex.Unlock()
+
+      if reply.Success {
+        heartbeatResponse := reply.Data.(*HeartbeatResponse)
+
+        if heartbeatResponse.Success {
+          numReached += 1
+        }
+      }
+
       return false
     }, HEARTBEAT_RPCS_TIMEOUT)
+
+  originalView := cc.view
+  cc.mutex.Unlock()
+
+  <-rpcCh
+
+  cc.mutex.Lock()
+  // note: don't unlock; that's the caller's responsibility
+
+  // view change occurred while waiting; ignore responses
+  if cc.view != originalView {
+    return
+  }
+
+  if numReached > cc.numPeers / 2 {
+    cc.reachedMajorityAt = time.Now()
+  }
+
+  if time.Now().Sub(cc.reachedMajorityAt) > ELECTION_TIMEOUT_MIN {
+    savedLeasesUntil := append([]time.Time(nil), cc.grantedLeasesUntil...)
+    view := cc.view
+
+    // haven't reached a majority of nodes in a while; might be partitioned, so
+    // revoke leases
+    go func() {
+      leasedNodes, _ := cc.getLeasedNodes(savedLeasesUntil)
+      <-cc.revokeLeases_mu(leasedNodes, view)
+    }()
+  }
 }
 
 
@@ -162,25 +213,29 @@ func (cc *CrowdControl) Heartbeat(args *HeartbeatArgs, response *HeartbeatRespon
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
+  if cc.view > args.View {
+    response.Success = false
+    return nil
+  }
+
   if cc.view < args.View {
     cc.setView_ml(args.View, args.Primary)
   }
 
-  if cc.view == args.View {
-    if cc.primary != args.Primary {
-      log.Fatalf("CC[%v] fatal primaries don't match %v and %v\n", cc.me,
-        cc.primary, args.Primary)
-    }
-
-    cc.lastHeartbeat = time.Now()
-
-    // ensure electionTimerCh send is non-blocking
-    select {
-    case cc.electionTimerCh <- true:
-    default:
-    }
+  if cc.primary != args.Primary {
+    log.Fatalf("CC[%v] fatal primaries don't match %v and %v\n", cc.me,
+      cc.primary, args.Primary)
   }
 
+  cc.lastHeartbeat = time.Now()
+
+  // ensure electionTimerCh send is non-blocking
+  select {
+  case cc.electionTimerCh <- true:
+  default:
+  }
+
+  response.Success = true
   return nil
 }
 
@@ -189,8 +244,8 @@ func (cc *CrowdControl) scheduleElection() {
   go func() {
     for {
       // attempt an election after a random timeout
-      timeout := (rand.Int63() % (ELECTION_TIMEOUT_MAX - ELECTION_TIMEOUT_MIN) +
-        ELECTION_TIMEOUT_MIN)
+      timeout := (rand.Int63() % (ELECTION_TIMEOUT_MAX_INT - ELECTION_TIMEOUT_MIN_INT) +
+        ELECTION_TIMEOUT_MIN_INT)
 
       select {
       case <-time.After(time.Duration(timeout) * time.Millisecond):
@@ -227,12 +282,16 @@ func (cc *CrowdControl) attemptElection_ml() {
   numAlreadyGranted := 0
   numRefused := 0
 
+  // clear get lease, as we're determining the new primary
+  cc.leaseUntil = time.Now()
+
   rpcCh := makeParallelRPCs(cc.nodes,
     // sends a RequestVote RPC to the given peer
     func(node int) chan *RPCReply {
       response := &RequestVoteResponse{}
       return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-        "CrowdControl.RequestVote", args, response, SERVER_RPC_RETRIES)
+        "CrowdControl.RequestVote", args, response,
+        int(ELECTION_RPCS_TIMEOUT / RPC_TIMEOUT))
     },
 
     // aggregates RequestVote replies; determines when to stop collecting them
@@ -307,10 +366,11 @@ func (cc *CrowdControl) setView_ml(view int, primary int) {
 
   cc.ol = &OperationLog{}
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
-
   cc.prepped = make(map[int]bool)
+
+  cc.reachedMajorityAt = time.Now()
   cc.leaseUntil = time.Now()
-  cc.leases = make([]time.Time, cc.numPeers, cc.numPeers)
+  cc.grantedLeasesUntil = make([]time.Time, cc.numPeers, cc.numPeers)
 }
 
 
@@ -319,7 +379,7 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
   defer cc.mutex.Unlock()
 
   if cc.view > args.View || cc.view >= args.NextView || time.Now().
-      Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN * time.Millisecond {
+      Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN {
     // log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
     // TODO: inform requester of view update
     response.Status = VOTE_REFUSED
@@ -596,6 +656,13 @@ func (cc *CrowdControl) RequestLease(args *RequestLeaseArgs,
     return nil
   }
 
+  if time.Now().Sub(cc.reachedMajorityAt) > ELECTION_TIMEOUT_MIN {
+    log.Printf("haven't reached majority\n")
+    // haven't reached a majority of nodes for a while; might be partitioned
+    response.Status = LEASE_REFUSED
+    return nil
+  }
+
   if cc.nodeHasFilterHash(args.Node, args.FilterHash) {
     response.Status = LEASE_GRANTED
   } else {
@@ -604,7 +671,7 @@ func (cc *CrowdControl) RequestLease(args *RequestLeaseArgs,
   }
 
   response.Until = args.Now.Add(LEASE_DURATION)
-  cc.leases[args.Node] = time.Now().Add(LEASE_DURATION)
+  cc.grantedLeasesUntil[args.Node] = time.Now().Add(LEASE_DURATION)
   return nil
 }
 
@@ -656,8 +723,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
   // don't worry about leases changed during this set() operation; they don't
   // compromise safety, since they will happen after the Prep() RPC
-  savedLeases := make([]time.Time, cc.numPeers, cc.numPeers)
-  copy(savedLeases, cc.leases)
+  savedLeasesUntil := append([]time.Time(nil), cc.grantedLeasesUntil...)
 
   op := &Operation{Add: true, Key: key}
   cc.ol.Append(op)
@@ -685,7 +751,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         }
 
         return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-          "CrowdControl.Prep", args, &PrepResponse{}, SERVER_RPC_RETRIES)
+          "CrowdControl.Prep", args, &PrepResponse{},
+          int(PREP_RPCS_TIMEOUT / RPC_TIMEOUT))
       },
 
       // aggregates Prep replies; determines when to stop collecting them
@@ -699,7 +766,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
           if prepResponse.Status == PREP_SUCCESS {
             // this node is up-to-date, so we can ignore its lease
-            savedLeases[reply.Node] = time.Now()
+            savedLeasesUntil[reply.Node] = time.Now()
             numPrepped += 1
 
             if numPrepped > cc.numPeers / 2 {
@@ -767,7 +834,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         }
         response := &CommitResponse{}
         return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-          "CrowdControl.Commit", args, response, SERVER_RPC_RETRIES)
+          "CrowdControl.Commit", args, response,
+          int(COMMIT_RPCS_TIMEOUT / RPC_TIMEOUT))
       },
 
       // aggregates Commit replies; determines when to stop collecting them
@@ -807,26 +875,12 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   }()
 
   // before returning response, we must ensure leases expire or are revoked
-  leasedNodes := make([]int, 0, cc.numPeers)
-  now := time.Now()
-
-  lastLeaseExpiry := savedLeases[0]
-  for node, leaseExpiry := range savedLeases {
-    if leaseExpiry.Sub(lastLeaseExpiry) > 0 {
-      lastLeaseExpiry = leaseExpiry
-    }
-
-    if leaseExpiry.Sub(now) > 0 {
-      leasedNodes = append(leasedNodes, node)
-    }
-  }
-
-  timeout := lastLeaseExpiry.Sub(now)
+  leasedNodes, timeout := cc.getLeasedNodes(savedLeasesUntil)
   numLeased := len(leasedNodes)
 
   originalView := cc.view
-  // must unlock *after* processing savedLeases, since it could be modified by
-  // Commit() RPC reply handler
+  // must unlock *after* processing savedLeasesUntil, since it could be
+  // modified by Commit() RPC reply handler
   cc.mutex.Unlock()
 
   if numLeased == 0 {
@@ -835,41 +889,14 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     // timeout is short enough that it's not worth making RPC calls
     <-time.After(timeout)
   } else {
-    // revoke leases
-    leasesRevokedCh := make(chan bool, 1)
-    numRevoked := 0
+    <-cc.revokeLeases_mu(leasedNodes, originalView)
 
-    makeParallelRPCs(leasedNodes,
-      // sends a RevokeLease RPC to the given peer
-      func(node int) chan *RPCReply {
-        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-          "CrowdControl.RevokeLease", args, &RevokeLeaseResponse{},
-          SERVER_RPC_RETRIES)
-      },
-
-      // handles a RevokeLease response
-      func(reply *RPCReply) bool {
-        if reply.Success {
-          response := reply.Data.(*RevokeLeaseResponse)
-          if response.Success {
-            numRevoked += 1
-            if numRevoked == numLeased {
-              leasesRevokedCh <- true
-            }
-          }
-        }
-
-        return false
-      }, REVOKE_LEASE_RPCS_TIMEOUT)
-
-    select {
-    case <-leasesRevokedCh:
-    case <-time.After(timeout):
-    }
+    // if we couldn't revoke leases, we've waited long enough such that the
+    // other nodes would start elections, clearing their leases
   }
 
   go func() {
-    // leases need to expire and commit needs to finish before releasing set mutex
+    // commit needs to finish before releasing set mutex
     <-commitDoneCh
     cc.releaseSetMutex(key, setMutex)
   }()
@@ -1006,6 +1033,56 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
 }
 
 
+func (cc *CrowdControl) getLeasedNodes(grantedLeasesUntil []time.Time) ([]int, time.Duration) {
+  leasedNodes := make([]int, 0, cc.numPeers)
+  now := time.Now()
+
+  lastLeaseExpiry := grantedLeasesUntil[0]
+  for node, leaseExpiry := range grantedLeasesUntil {
+    if leaseExpiry.Sub(lastLeaseExpiry) > 0 {
+      lastLeaseExpiry = leaseExpiry
+    }
+
+    if leaseExpiry.Sub(now) > 0 {
+      leasedNodes = append(leasedNodes, node)
+    }
+  }
+
+  timeout := lastLeaseExpiry.Sub(now)
+  return leasedNodes, timeout
+}
+
+
+func (cc *CrowdControl) revokeLeases_mu(leasedNodes []int, view int) chan []*RPCReply {
+  args := &RevokeLeaseArgs{View: view}
+
+  rpcCh := makeParallelRPCs(leasedNodes,
+    // sends a RevokeLease RPC to the given peer
+    func(node int) chan *RPCReply {
+      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
+        "CrowdControl.RevokeLease", args, &RevokeLeaseResponse{},
+        int(REVOKE_LEASE_RPCS_TIMEOUT / RPC_TIMEOUT))
+    },
+
+    // handles a RevokeLease response
+    func(reply *RPCReply) bool {
+      cc.mutex.Lock()
+      defer cc.mutex.Unlock()
+
+      if reply.Success {
+        response := reply.Data.(*RevokeLeaseResponse)
+        if response.Success {
+          cc.grantedLeasesUntil[reply.Node] = time.Now()
+        }
+      }
+
+      return false
+    }, REVOKE_LEASE_RPCS_TIMEOUT)
+
+  return rpcCh
+}
+
+
 func (cc *CrowdControl) rejectConnFrom(node int) {
   cc.rejectMutex.Lock()
   defer cc.rejectMutex.Unlock()
@@ -1090,14 +1167,15 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.setMutexes = make(map[string]*SetMutex)
   cc.prepped = make(map[int]bool)
 
+  cc.reachedMajorityAt = time.Now()
   cc.leaseUntil = time.Now()
-  cc.leases = make([]time.Time, cc.numPeers, cc.numPeers)
+
+  cc.grantedLeasesUntil = make([]time.Time, cc.numPeers, cc.numPeers)
+  for i := 0; i < cc.numPeers; i++ {
+    cc.grantedLeasesUntil[i] = time.Now()
+  }
 
   cc.inflightKeys = make(map[string]time.Time)
-
-  for i := 0; i < cc.numPeers; i++ {
-    cc.leases[i] = time.Now()
-  }
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)

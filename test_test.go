@@ -48,7 +48,7 @@ func TestLeaderElection(t *testing.T) {
   log.Printf("\n\nTestLeaderElection(): Begin\n\n")
 
   _, ccs := makeCluster(5, "le")
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   primary := ccs[0].primary
   view := ccs[0].view
@@ -68,7 +68,7 @@ func TestLeaderElection(t *testing.T) {
     log.Printf("Primary %v going down\n", primary)
     ccs[primary].dead = true
 
-    time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+    time.Sleep(3 * ELECTION_TIMEOUT_MAX)
     for _, cc := range ccs {
       if !cc.dead {
         primary = cc.primary
@@ -78,7 +78,7 @@ func TestLeaderElection(t *testing.T) {
     }
 
     if primary == -1 {
-      t.Fatalf("No primary re-elected after %v ms\n", 2 * ELECTION_TIMEOUT_MAX)
+      t.Fatalf("No primary elected\n")
     }
 
     for _, cc := range ccs {
@@ -95,7 +95,7 @@ func TestLeaderElection(t *testing.T) {
 
   log.Printf("Primary %v going down\n", primary)
   ccs[primary].dead = true
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   for _, cc := range ccs {
     if cc.dead {
@@ -118,7 +118,7 @@ func TestPrimarySelection(t *testing.T) {
   client.Init("/tmp/ps-client.sock", peers)
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   primary := ccs[0].primary
   view := ccs[0].view
@@ -158,7 +158,7 @@ func TestPrimarySelection(t *testing.T) {
   }
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   // view/primary should be the same
   for _, cc := range ccs {
@@ -180,7 +180,7 @@ func TestPrimarySelection(t *testing.T) {
   }
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   // view/primary should update
   primary = goodNode
@@ -216,7 +216,7 @@ func TestPrimarySelection(t *testing.T) {
   }
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   // view/primary should update
   primary = staleNode
@@ -278,7 +278,7 @@ func TestGetSetSingle(t *testing.T) {
   client.Init("/tmp/gss0-client.sock", peers)
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
   checkBasicGetSetOps(t, &client)
 
   killCluster(ccs)
@@ -294,7 +294,7 @@ func TestGetSetMultiple(t *testing.T) {
   client.Init("/tmp/gsm0-client.sock", peers)
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
   checkBasicGetSetOps(t, &client)
 
   killCluster(ccs)
@@ -341,7 +341,7 @@ func TestGetLeases(t *testing.T) {
   client.Init("/tmp/gl-client.sock", peers)
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
   key, value := "lazy", "dog"
 
   // wait for set to propagate
@@ -413,7 +413,7 @@ func TestGetInvalid(t *testing.T) {
   client.Init("/tmp/gl-client.sock", peers)
 
   // wait for leader election
-  time.Sleep(3 * ELECTION_TIMEOUT_MAX * time.Millisecond)
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
   primary := ccs[0].primary
   invalid1 := (primary + 1) % numPeers
