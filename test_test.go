@@ -558,9 +558,7 @@ func BenchmarkGet(b *testing.B) {
 
     if !exists {
       log.Printf("%v doesn't have an associated value\n", keys[index])
-    }
-
-    if value != values[index] {
+    } else if value != values[index] {
       log.Printf("incorrect value %v, expected %v\n", value, values[index])
     }
   }
@@ -568,85 +566,80 @@ func BenchmarkGet(b *testing.B) {
   cluster.killAll()
 }
 
-// func TestGetThroughput(t *testing.T) {
-//   var cc CrowdControl
-//   peers := []string{":8001"}
-//   cc.Init(peers, 0)
-// 
-//   var seedClient Client
-//   seedClient.Init("/tmp/bg-client.sock", peers)
-// 
-//   numPairs := 10
-//   keys := make([]string, numPairs)
-// 
-//   fmt.Printf("loading kv\n")
-//   for i := 0; i < numPairs; i++ {
-//     keys[i] = generateString(16)
-//     // values[i] = generateString(32)
-//   }
-// 
-//   fmt.Printf("starting test\n")
-//   numGoFuncs := 5
-// 
-//   numOps := make([]int, numGoFuncs)
-//   doneCh := make(chan bool)
-// 
-//   var wg sync.WaitGroup
-//   wg.Add(numGoFuncs)
-// 
-//   start := time.Now()
-// 
-//   for i := 0; i < numGoFuncs; i++ {
-//     go func(i int) {
-//       var client Client
-//       clientSock := fmt.Sprintf("/tmp/bg-client%v.sock", i)
-//       client.Init(clientSock, peers)
-// 
-//       // randSrc := rand.NewSource(time.Now().UnixNano())
-//       // randGen := rand.New(randSrc)
-// 
-//       args := &GetArgs{Key: "what"}
-//       resp := &GetResponse{}
-// 
-//       MainLoop:
-//       for {
-//         client, err := rpc.Dial("tcp", peers[0])
-//         if err != nil {
-//           panic(err)
-//         }
-//         client.Call("CrowdControl.Get", args, resp)
-//         client.Close()
-// 
-//         // if !exists {
-//         //   log.Printf("%v doesn't have an associated value\n", keys[index])
-//         // } else if value != values[index] {
-//         //   log.Printf("incorrect value %v, expected %v\n", value, values[index])
-//         // }
-// 
-//         numOps[i] += 1
-// 
-//         select {
-//         case <-doneCh:
-//           break MainLoop
-//         default:
-//         }
-//       }
-// 
-//       wg.Done()
-//     }(i)
-//   }
-// 
-//   time.Sleep(5 * time.Second)
-//   close(doneCh)
-//   wg.Wait()
-// 
-//   end := time.Now()
-// 
-//   totalOps := 0
-//   for i := 0; i < numGoFuncs; i++ {
-//     totalOps += numOps[i]
-//   }
-//   fmt.Printf("total time = %v, ops = %v\n", end.Sub(start), totalOps)
-// 
-//   cluster.killAll()
-// }
+func TestGetThroughput(t *testing.T) {
+  numPeers := 5
+  peers, cluster := makeCluster(numPeers, "bg")
+
+  var seedClient Client
+  seedClient.Init("/tmp/gth-client.sock", peers)
+
+  numPairs := 10000
+  keys := make([]string, numPairs)
+  values := make([]string, numPairs)
+
+  fmt.Printf("loading kv\n")
+  for i := 0; i < numPairs; i++ {
+    keys[i] = generateString(16)
+    values[i] = generateString(32)
+
+    seedClient.Set(keys[i], values[i])
+  }
+
+  fmt.Printf("starting test\n")
+  numClients := 10
+
+  numOps := make([]int, numClients)
+  doneCh := make(chan bool)
+
+  var wg sync.WaitGroup
+  wg.Add(numClients)
+
+  start := time.Now()
+
+  for i := 0; i < numClients; i++ {
+    go func(i int) {
+      var client Client
+      clientSock := fmt.Sprintf("/tmp/bg-client%v.sock", i)
+      client.Init(clientSock, peers)
+
+      randSrc := rand.NewSource(time.Now().UnixNano())
+      randGen := rand.New(randSrc)
+
+      MainLoop:
+      for {
+        index := randGen.Intn(numPairs)
+        value, exists := client.Get(keys[index])
+
+        if !exists {
+          log.Printf("%v doesn't have an associated value\n", keys[index])
+        } else if value != values[index] {
+          log.Printf("incorrect value %v, expected %v\n", value, values[index])
+        }
+
+        numOps[i] += 1
+
+        select {
+        case <-doneCh:
+          break MainLoop
+        default:
+        }
+      }
+
+      wg.Done()
+    }(i)
+  }
+
+  time.Sleep(5 * time.Second)
+  close(doneCh)
+
+  wg.Wait()
+  end := time.Now()
+
+  totalOps := 0
+  for i := 0; i < numClients; i++ {
+    totalOps += numOps[i]
+  }
+
+  fmt.Printf("total time = %v, ops = %v\n", end.Sub(start), totalOps)
+  cluster.killAll()
+}
