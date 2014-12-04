@@ -2,15 +2,16 @@ package cc
 
 import (
   "log"
-  "net"
-  "net/rpc"
+  "sync"
   "time"
+  "net/rpc"
   "crypto/sha256"
-  "os"
-  "fmt"
 )
 
 const (
+  // if true, use unix sockets; if false, use tcp
+  USE_UNIX_SOCKETS = true
+
   // time to wait for RPCs
   RPC_TIMEOUT = 10 * time.Millisecond
 
@@ -207,53 +208,104 @@ type RevokeLeaseResponse struct {
 }
 
 
+type RPCTarget struct {
+  mutex sync.Mutex
+  client *rpc.Client  // saved connection
+  dead bool  // used by the testing framework to disable RPCs
+  sender string
+  receiver string
+  receiverNode int
+}
+
+
+func (rt *RPCTarget) Init(sender string, receiver string, receiverNode int) {
+  rt.client = nil
+  rt.dead = false
+  rt.sender = sender
+  rt.receiver = receiver
+  rt.receiverNode = receiverNode
+}
+
+
+func (rt *RPCTarget) die() {
+  rt.mutex.Lock()
+  defer rt.mutex.Unlock()
+  rt.dead = true
+}
+
+
+func (rt *RPCTarget) live() {
+  rt.mutex.Lock()
+  defer rt.mutex.Unlock()
+  rt.dead = false
+}
+
+
+func (rt *RPCTarget) call(name string, args interface{}, reply *RPCReply) {
+  rt.mutex.Lock()
+
+  if rt.dead {
+    reply.Success = false
+    rt.mutex.Unlock()
+    return
+  }
+
+  client := rt.client
+  if client == nil {
+    var err error
+
+    // attempt to connect to get a client
+    if USE_UNIX_SOCKETS {
+      client, err = rpc.Dial("unix", rt.receiver)
+    } else {
+    log.Printf("making tcp conn %v -> %v\n", rt.sender, rt.receiver)
+      client, err = rpc.Dial("tcp", rt.receiver)
+    }
+
+    if err != nil {
+      log.Printf("Dial() failed: %v\n", err)
+      reply.Success = false
+      rt.mutex.Unlock()
+      return
+    }
+  }
+
+  rt.client = client
+  rt.mutex.Unlock()
+
+  err := client.Call(name, args, reply.Data)
+  if err != nil {
+    log.Printf("Call() failed: %v\n", err)
+    reply.Success = false
+
+    // if connection closed, reset client to try connecting again next time
+    if err == rpc.ErrShutdown {
+      rt.mutex.Lock()
+      if rt.client == client {
+        rt.client = nil
+      }
+      rt.mutex.Unlock()
+    }
+    return
+  }
+
+  reply.Success = true
+}
+
+
 /* Makes an RPC to the given `peer`, calling the function specified by `name`.
  * Passes in the arguments `args`. Requires an allocated `response` that can
  * hold the reply data. Returns a channel that holds the reply. */
-func makeRPC(sender string, receiver string, receiverNode int, name string,
-    args interface{}, response interface{}) chan *RPCReply {
+func (rt *RPCTarget) MakeRPC(name string, args interface{},
+    response interface{}) chan *RPCReply {
   rpcCh := make(chan *RPCReply, 1)
-  // suffix sender with "-sender" to not conflict with server socket
-  sender = fmt.Sprintf("%v-sender", sender)
 
   go func() {
     // make RPC call, putting result in channel
-    reply := &RPCReply{Node: receiverNode}
-
-    // configure connection
-    var d net.Dialer
-    senderAddr, err := net.ResolveUnixAddr("unix", sender)
-
-    if err != nil {
-      log.Printf("ResolveUnixAddr() failed: %v\n", err)
-      reply.Success = false
-      return
-    }
-
-    // TODO: need a better way to determine sender
-    os.Remove(sender)
-    d.LocalAddr = senderAddr
-    unixConn, err := d.Dial("unix", receiver)
-
-    if err != nil {
-      // log.Printf("Dial() failed: %v\n", err)
-      reply.Success = false
-      return
-    }
-
-    conn := rpc.NewClient(unixConn)
-    defer conn.Close()
-
+    reply := &RPCReply{Node: rt.receiverNode}
     reply.Data = response
-    err = conn.Call(name, args, reply.Data)
 
-    if err != nil {
-      // log.Printf("Call() failed: %v\n", err)
-      reply.Success = false
-      return
-    }
-
-    reply.Success = true
+    rt.call(name, args, reply)
     rpcCh <- reply
   }()
 
@@ -274,13 +326,13 @@ func makeRPC(sender string, receiver string, receiverNode int, name string,
 
 // TODO: should numRetries be a param?
 /* Makes an RPC, as per `makeRPC`. Retries `numRetries` times. */
-func makeRPCRetry(sender string, receiver string, receiverNode int, name string,
-    args interface{}, replyType interface{}, numRetries int) chan *RPCReply {
+func (rt *RPCTarget) MakeRPCRetry(name string, args interface{},
+    response interface{}, numRetries int) chan *RPCReply {
   replyCh := make(chan *RPCReply, 1)
 
   go func() {
     for i := 0; i < numRetries; i++ {
-      ch := makeRPC(sender, receiver, receiverNode, name, args, replyType)
+      ch := rt.MakeRPC(name, args, response)
       reply := <-ch
 
       // use result of the first successful RPC, or the last RPC if others fail

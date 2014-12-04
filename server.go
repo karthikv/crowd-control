@@ -7,7 +7,6 @@ import (
   "net/rpc"
   "math/rand"
   "os"
-  "syscall"
   "time"
   "errors"
   "crypto/sha256"
@@ -51,10 +50,10 @@ const (
 
   // max length of operation log
   OP_LOG_CAPACITY = 256
-
-  // error messages
-  GET_LEASE_ERROR_MESSAGE = "could not get lease"
 )
+
+
+var ErrCouldNotGetLease = errors.New("could not get lease")
 
 
 // TODO: add random seed later
@@ -74,18 +73,15 @@ type CrowdControl struct {
   mutex sync.Mutex
   listener net.Listener
 
-  // used by the testing harness to test edge cases
-  dead bool
-  unreliable bool
-
-  reject map[string]bool
-  rejectMutex sync.Mutex
+  dead bool  // used by testing framework to determine if this node is dead
 
   // set of machines within the cluster
   peers []string  // node -> unix socket string
   numPeers int
-  nodes []int  // node numbers
   me int  // index of this machine
+
+  nodes []int  // node numbers
+  rts []*RPCTarget  // node -> RPCTarget that maintains persistent connection
 
   // views to disambiguate the primary, as in VR
   view int
@@ -157,8 +153,7 @@ func (cc *CrowdControl) sendHeartbeat_ml() {
     // sends a Heartbeat RPC to the given peer
     func(node int) chan *RPCReply {
       response := &HeartbeatResponse{}
-      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-        "CrowdControl.Heartbeat", args, response,
+      return cc.rts[node].MakeRPCRetry("CrowdControl.Heartbeat", args, response,
         int(HEARTBEAT_RPCS_TIMEOUT / RPC_TIMEOUT))
     },
 
@@ -289,8 +284,7 @@ func (cc *CrowdControl) attemptElection_ml() {
     // sends a RequestVote RPC to the given peer
     func(node int) chan *RPCReply {
       response := &RequestVoteResponse{}
-      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-        "CrowdControl.RequestVote", args, response,
+      return cc.rts[node].MakeRPCRetry("CrowdControl.RequestVote", args, response,
         int(ELECTION_RPCS_TIMEOUT / RPC_TIMEOUT))
     },
 
@@ -426,9 +420,8 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
         Now: time.Now(),
       }
 
-      ch := makeRPCRetry(cc.peers[cc.me], cc.peers[cc.primary], cc.primary,
-        "CrowdControl.RequestLease", &leaseArgs, &RequestLeaseResponse{},
-        SERVER_RPC_RETRIES)
+      ch := cc.rts[cc.primary].MakeRPCRetry("CrowdControl.RequestLease", &leaseArgs,
+        &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
       reply := <-ch
 
       if reply.Success {
@@ -444,7 +437,7 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
           cc.leaseUntil = leaseResponse.Until
         }
       } else {
-        return errors.New(GET_LEASE_ERROR_MESSAGE)
+        return ErrCouldNotGetLease
       }
     }
   }
@@ -483,15 +476,12 @@ func (cc *CrowdControl) getKVPairFromPrimary(key string) {
     Key: key,
   }
 
-  peerMe := cc.peers[cc.me]
   primary := cc.primary
-  peerPrimary := cc.peers[primary]
-
   cc.mutex.Unlock()
 
   if shouldRequestPair {
-    ch := makeRPCRetry(peerMe, peerPrimary, primary, "CrowdControl.RequestKVPair",
-      &args, &RequestKVPairResponse{}, SERVER_RPC_RETRIES)
+    ch := cc.rts[primary].MakeRPCRetry("CrowdControl.RequestKVPair", &args,
+      &RequestKVPairResponse{}, SERVER_RPC_RETRIES)
     reply := <-ch
 
     cc.mutex.Lock()
@@ -552,9 +542,8 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
       Exists: exists,
     }
 
-    ch := makeRPCRetry(cc.peers[cc.me], cc.peers[args.Node], args.Node,
-      "CrowdControl.SendKVPair", &sendArgs, &SendKVPairResponse{},
-      SERVER_RPC_RETRIES)
+    ch := cc.rts[args.Node].MakeRPCRetry("CrowdControl.SendKVPair", &sendArgs,
+      &SendKVPairResponse{}, SERVER_RPC_RETRIES)
 
     originalView := cc.view
     cc.mutex.Unlock()
@@ -750,8 +739,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           Ops: ops,
         }
 
-        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-          "CrowdControl.Prep", args, &PrepResponse{},
+        return cc.rts[node].MakeRPCRetry("CrowdControl.Prep", args, &PrepResponse{},
           int(PREP_RPCS_TIMEOUT / RPC_TIMEOUT))
       },
 
@@ -806,7 +794,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
       }
 
       // successfully prepped
-      log.Printf("CC[%v] set by %v/%v peers\n", cc.me, numPrepped, cc.numPeers)
+      // log.Printf("CC[%v] set by %v/%v peers\n", cc.me, numPrepped, cc.numPeers)
     } else {
       // throttle requests
       time.Sleep(waitTime)
@@ -833,8 +821,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           Nonce: nonce,
         }
         response := &CommitResponse{}
-        return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-          "CrowdControl.Commit", args, response,
+        return cc.rts[node].MakeRPCRetry("CrowdControl.Commit", args, response,
           int(COMMIT_RPCS_TIMEOUT / RPC_TIMEOUT))
       },
 
@@ -1059,9 +1046,8 @@ func (cc *CrowdControl) revokeLeases_mu(leasedNodes []int, view int) chan []*RPC
   rpcCh := makeParallelRPCs(leasedNodes,
     // sends a RevokeLease RPC to the given peer
     func(node int) chan *RPCReply {
-      return makeRPCRetry(cc.peers[cc.me], cc.peers[node], node,
-        "CrowdControl.RevokeLease", args, &RevokeLeaseResponse{},
-        int(REVOKE_LEASE_RPCS_TIMEOUT / RPC_TIMEOUT))
+      return cc.rts[node].MakeRPCRetry("CrowdControl.RevokeLease", args,
+        &RevokeLeaseResponse{}, int(REVOKE_LEASE_RPCS_TIMEOUT / RPC_TIMEOUT))
     },
 
     // handles a RevokeLease response
@@ -1083,64 +1069,25 @@ func (cc *CrowdControl) revokeLeases_mu(leasedNodes []int, view int) chan []*RPC
 }
 
 
-func (cc *CrowdControl) rejectConnFrom(node int) {
-  cc.rejectMutex.Lock()
-  defer cc.rejectMutex.Unlock()
-
-  peer := cc.peers[node]
-  cc.reject[peer] = true
-}
-
-
-func (cc *CrowdControl) rejectConnFromAll() {
-  cc.rejectMutex.Lock()
-  defer cc.rejectMutex.Unlock()
-
-  for i, peer := range cc.peers {
-    // don't reject from self
-    if i != cc.me {
-      cc.reject[peer] = true
-    }
-  }
-}
-
-
-func (cc *CrowdControl) acceptConnFrom(node int) {
-  cc.rejectMutex.Lock()
-  defer cc.rejectMutex.Unlock()
-
-  peer := cc.peers[node]
-  delete(cc.reject, peer)
-}
-
-
-func (cc *CrowdControl) acceptConnFromAll() {
-  cc.rejectMutex.Lock()
-  defer cc.rejectMutex.Unlock()
-
-  for _, peer := range cc.peers {
-    delete(cc.reject, peer)
-  }
-}
-
-
 /* Creates a CrowdControl peer. `peers` is an array of peers within the
  * cluster, where each element is a string representing a socket. `me` is the
  * index of this peer. */
 func (cc *CrowdControl) Init(peers []string, me int) {
-  cc.dead = false
-  cc.unreliable = false
-
-  cc.reject = make(map[string]bool)
-
   cc.peers = peers
   cc.numPeers = len(peers)
+  cc.me = me
 
   cc.nodes = make([]int, cc.numPeers, cc.numPeers)
   for i := 0; i < cc.numPeers; i++ {
     cc.nodes[i] = i
   }
-  cc.me = me
+
+  cc.rts = make([]*RPCTarget, cc.numPeers, cc.numPeers)
+  for i := 0; i < cc.numPeers; i++ {
+    rt := &RPCTarget{}
+    rt.Init(peers[me], peers[i], i)
+    cc.rts[i] = rt
+  }
 
   cc.view = -1
   cc.nextView = 0
@@ -1180,9 +1127,16 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)
 
-  // remove any potentially stale socket (only when using unix sockets)
-  os.Remove(peers[me])
-  listener, err := net.Listen("unix", peers[me])
+  var listener net.Listener
+  var err error
+
+  if USE_UNIX_SOCKETS {
+    // remove any potentially stale socket
+    os.Remove(peers[me])
+    listener, err = net.Listen("unix", peers[me])
+  } else {
+    listener, err = net.Listen("tcp", peers[me])
+  }
 
   if err != nil {
     log.Fatalf("CC[%v] Listen() failed: %v\n", me, err)
@@ -1191,53 +1145,15 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.listener = listener
 
   go func() {
-    for !cc.dead {
+    for {
       conn, err := cc.listener.Accept()
-
-      // Accept() could take a long time; check for dead again
-      if cc.dead && err == nil {
-        conn.Close()
-      }
-
-      if !cc.dead && err == nil {
-        // remove -sender suffix
-        sender := conn.RemoteAddr().String()
-        sender = sender[:len(sender) - 7]
-
-        cc.rejectMutex.Lock()
-        reject := cc.reject[sender]
-        cc.rejectMutex.Unlock()
-
-        if reject {
-          conn.Close()
-        } else if cc.unreliable && (rand.Int63() % 1000) < 100 {
-          // 10% chance to drop request
-          conn.Close()
-        } else if cc.unreliable && (rand.Int63() % 1000) < 200 {
-          // 20% chance to drop response if request wasn't dropped
-          unixConn := conn.(*net.UnixConn)
-
-          handle, err := unixConn.File()
-          if err != nil {
-            log.Printf("CC[%v] File() failed: %v\n", me, err)
-          } else {
-            // stop transmissions (not receptions) on unix socket
-            err := syscall.Shutdown(int(handle.Fd()), syscall.SHUT_WR)
-            if err != nil {
-              log.Printf("CC[%v] Shutdown() failed: %v\n", me, err)
-            }
-          }
-
-          go rpcServer.ServeConn(conn)
-       } else {
-          // successful request/response
-          go rpcServer.ServeConn(conn)
-        }
-      }
 
       if err != nil {
         log.Printf("CC[%v] Accept() failed: %v\n", me, err)
+        continue
       }
+
+      go rpcServer.ServeConn(conn)
     }
   }()
 }
