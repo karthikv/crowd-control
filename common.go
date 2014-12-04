@@ -10,7 +10,7 @@ import (
 
 const (
   // if true, use unix sockets; if false, use tcp
-  USE_UNIX_SOCKETS = true
+  USE_UNIX_SOCKETS = false
 
   // time to wait for RPCs
   RPC_TIMEOUT = 10 * time.Millisecond
@@ -258,7 +258,6 @@ func (rt *RPCTarget) call(name string, args interface{}, reply *RPCReply) {
     if USE_UNIX_SOCKETS {
       client, err = rpc.Dial("unix", rt.receiver)
     } else {
-    log.Printf("making tcp conn %v -> %v\n", rt.sender, rt.receiver)
       client, err = rpc.Dial("tcp", rt.receiver)
     }
 
