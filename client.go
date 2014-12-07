@@ -35,12 +35,11 @@ func (client *Client) Get(key string) (string, bool) {
   client.mutex.Lock()
   defer client.mutex.Unlock()
 
-  // TODO: try different servers
   args := &GetArgs{Key: key}
   waitTime := WAIT_TIME_INITIAL
 
   for i := 0; i < CLIENT_RPC_RETRIES; i++ {
-    servers := client.pickServers()
+    servers := client.pickServers(1)
     outCh := make(chan *GetResponse, len(servers))
 
     for i, _ := range servers {
@@ -97,30 +96,36 @@ func (client *Client) Get(key string) (string, bool) {
 }
 
 
-func (client *Client) pickServers() []string {
-  // pick a majority of servers to contact
-  numChosen := client.numServers / 2 + 1
-  servers := make([]string, numChosen, numChosen)
+func (client *Client) pickServers(numServers int) []int {
+  // pick a set of servers to contact
+  servers := make([]int, numServers, numServers)
 
   client.weightMutex.Lock()
   defer client.weightMutex.Unlock()
 
+  // duplicate weights so we can modify
+  weights := append([]int(nil), client.weights...)
+
   totalWeight := 0
-  for _, weight := range client.weights {
+  for _, weight := range weights {
     totalWeight += weight
   }
 
-  for i := 0; i < numChosen; i++ {
+  for i := 0; i < numServers; i++ {
     randWeight := rand.Int() % totalWeight
     cumWeight := 0
 
-    for j, weight := range client.weights {
+    for j, weight := range weights {
       cumWeight += weight
       if randWeight < cumWeight {
-        servers[i] = client.servers[j]
+        servers[i] = j
         break
       }
     }
+
+    removed := servers[i]
+    totalWeight -= weights[removed]
+    weights = append(weights[:removed], weights[removed + 1:]...)
   }
 
   return servers
