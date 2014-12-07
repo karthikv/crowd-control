@@ -577,7 +577,7 @@ func TestGetThroughput(t *testing.T) {
   keys := make([]string, numPairs)
   values := make([]string, numPairs)
 
-  fmt.Printf("loading kv\n")
+  log.Printf("Loading %v KV pairs...\n", numPairs)
   for i := 0; i < numPairs; i++ {
     keys[i] = generateString(16)
     values[i] = generateString(32)
@@ -585,8 +585,8 @@ func TestGetThroughput(t *testing.T) {
     seedClient.Set(keys[i], values[i])
   }
 
-  fmt.Printf("starting test\n")
-  numClients := 10
+  log.Printf("Starting throughput measurement...\n")
+  numClients := 8
 
   numOps := make([]int, numClients)
   doneCh := make(chan bool)
@@ -640,6 +640,6 @@ func TestGetThroughput(t *testing.T) {
     totalOps += numOps[i]
   }
 
-  fmt.Printf("total time = %v, ops = %v\n", end.Sub(start), totalOps)
+  log.Printf("total time %v, ops %v\n", end.Sub(start), totalOps)
   cluster.killAll()
 }
