@@ -1,4 +1,4 @@
-package cc
+package cache
 
 import (
   "container/list"

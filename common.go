@@ -6,6 +6,8 @@ import (
   "time"
   "net/rpc"
   "crypto/sha256"
+
+  "./op_log"
 )
 
 const (
@@ -138,7 +140,7 @@ type PrepArgs struct {
   Invalid bool
   Nonce int
   Key string
-  Ops []Operation
+  Ops []op_log.Operation
 }
 
 type PrepResponse struct {

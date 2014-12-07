@@ -10,6 +10,7 @@ import (
 )
 
 type Cluster []*CrowdControl
+const CACHE_CAPACITY = 64 * 1024 * 1024  // 64 MB
 
 func makeCluster(numPeers int, prefix string) ([]string, Cluster) {
   // cluster uses randomness for elections
@@ -33,7 +34,7 @@ func makeCluster(numPeers int, prefix string) ([]string, Cluster) {
   cluster := make(Cluster, numPeers)
   for i := 0; i < numPeers; i++ {
     cc := &CrowdControl{}
-    cc.Init(peers, i)
+    cc.Init(peers, i, CACHE_CAPACITY)
     cluster[i] = cc
   }
 
@@ -107,8 +108,6 @@ func checkView(t *testing.T, cc *CrowdControl, view int, primary int) {
 }
 
 func TestLeaderElection(t *testing.T) {
-  log.Printf("\n\nTestLeaderElection(): Begin\n\n")
-
   _, cluster := makeCluster(5, "le")
   time.Sleep(3 * ELECTION_TIMEOUT_MAX)
 
@@ -168,11 +167,9 @@ func TestLeaderElection(t *testing.T) {
   }
 
   cluster.killAll()
-  log.Printf("\n\nTestLeaderElection(): End\n\n")
 }
 
 func TestPrimarySelection(t *testing.T) {
-  log.Printf("\n\nTestPrimarySelection(): Begin\n\n")
   numPeers := 5
   peers, cluster := makeCluster(numPeers, "ps")
 
@@ -276,7 +273,6 @@ func TestPrimarySelection(t *testing.T) {
   }
 
   cluster.killAll()
-  log.Printf("\n\nTestPrimarySelection(): End\n\n")
 }
 
 func checkBasicGetSetOps(t *testing.T, client *Client) {
@@ -315,7 +311,6 @@ func checkBasicGetSetOps(t *testing.T, client *Client) {
 
 // single client, single server
 func TestGetSetSingle(t *testing.T) {
-  log.Printf("\n\nTestGetSetSingle(): Begin\n\n")
   peers, cluster := makeCluster(1, "gss")
 
   var client Client
@@ -326,12 +321,10 @@ func TestGetSetSingle(t *testing.T) {
   checkBasicGetSetOps(t, &client)
 
   cluster.killAll()
-  log.Printf("\n\nTestGetSetSingle(): End\n\n")
 }
 
 // multiple server, single client
 func TestGetSetMultiple(t *testing.T) {
-  log.Printf("\n\nTestGetSetMultiple(): Begin\n\n")
   peers, cluster := makeCluster(5, "gsm")
 
   var client Client
@@ -342,7 +335,6 @@ func TestGetSetMultiple(t *testing.T) {
   checkBasicGetSetOps(t, &client)
 
   cluster.killAll()
-  log.Printf("\n\nTestGetSetMultiple(): End\n\n")
 }
 
 type getResponseChecker func(*testing.T, *GetResponse, error) bool
@@ -377,7 +369,6 @@ func checkGetOperation(t *testing.T, cluster Cluster, key string,
 }
 
 func TestGetLeases(t *testing.T) {
-  log.Printf("\n\nTestGetLease(): Begin\n\n")
   numPeers := 5
   peers, cluster := makeCluster(numPeers, "gl")
 
@@ -400,21 +391,22 @@ func TestGetLeases(t *testing.T) {
   clusterNoPrimary := append(Cluster(nil), cluster...)
   clusterNoPrimary = append(clusterNoPrimary[:primary], clusterNoPrimary[primary + 1:]...)
 
-  checkGetOperation(t, clusterNoPrimary, key,
-    func(t *testing.T, response *GetResponse, err error) bool {
-      // should not be able to finish get, since primary is down
-      if err == nil {
-        t.Logf("Get didn't acquire lease from primary\n")
-        return false
-      }
+  validateGetNoLease := func(t *testing.T, response *GetResponse, err error) bool {
+    // should not be able to finish get, since primary is down
+    if err == nil {
+      t.Logf("Get didn't acquire lease from primary\n")
+      return false
+    }
 
-      if err != ErrCouldNotGetLease {
-        t.Logf("Get had incorrect error %v\n", err)
-        return false
-      }
+    if err != ErrCouldNotGetLease {
+      t.Logf("Get had incorrect error %v\n", err)
+      return false
+    }
 
-      return true
-    })
+    return true
+  }
+
+  checkGetOperation(t, clusterNoPrimary, key, validateGetNoLease)
 
   validateGet := func(t *testing.T, response *GetResponse, err error) bool {
     // should be able to acquire lease and finish get
@@ -440,16 +432,19 @@ func TestGetLeases(t *testing.T) {
   cluster.enableTo(primary)
   checkGetOperation(t, clusterNoPrimary, key, validateGet)
 
+  // should be able to operate with lease without primary
   cluster.disableTo(primary)
   time.Sleep(LEASE_DURATION / 2)
-
   checkGetOperation(t, clusterNoPrimary, key, validateGet)
+
+  // lease expired; should no longer be able to operate
+  time.Sleep(LEASE_DURATION / 2)
+  checkGetOperation(t, clusterNoPrimary, key, validateGetNoLease)
+
   cluster.killAll()
-  log.Printf("\n\nTestGetLease(): End\n\n")
 }
 
 func TestGetInvalid(t *testing.T) {
-  log.Printf("\n\nTestGetInvalid(): Begin\n\n")
   numPeers := 5
   peers, cluster := makeCluster(numPeers, "gl")
 
@@ -516,7 +511,6 @@ func TestGetInvalid(t *testing.T) {
     })
 
   cluster.killAll()
-  log.Printf("\n\nTestGetInvalid(): End\n\n")
 }
 
 var chars = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")

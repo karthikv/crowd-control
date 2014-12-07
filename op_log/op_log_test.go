@@ -1,4 +1,4 @@
-package cc
+package op_log
 
 import (
   "fmt"

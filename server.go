@@ -10,6 +10,9 @@ import (
   "time"
   "errors"
   "crypto/sha256"
+
+  "./op_log"
+  "./cache"
 )
 
 const (
@@ -95,13 +98,13 @@ type CrowdControl struct {
   electionTimerCh chan bool
 
   // key-value pairs
-  cache map[string]string
+  cache *cache.Cache
 
   // whether the data for a given key on a given node is invalid
   filters []map[string]bool
 
   // operation log
-  ol *OperationLog
+  ol *op_log.OperationLog
 
   // maintains key -> lock mappings; must lock a given key while setting
   setMutexes map[string]*SetMutex
@@ -358,7 +361,7 @@ func (cc *CrowdControl) setView_ml(view int, primary int) {
   default:
   }
 
-  cc.ol = &OperationLog{}
+  cc.ol = &op_log.OperationLog{}
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
   cc.prepped = make(map[int]bool)
 
@@ -452,7 +455,7 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
     }
   } else {
     response.Status = GET_SUCCESS
-    response.Value, response.Exists = cc.cache[args.Key]
+    response.Value, response.Exists = cc.cache.Get(args.Key)
   }
 
   return nil
@@ -520,18 +523,18 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
 
     if cc.filters[cc.me][args.Key] {
       value, exists = "", false
-      delete(cc.cache, args.Key)
+      cc.cache.Delete(args.Key)
       delete(cc.filters[cc.me], args.Key)
 
       // TODO: does this cause too many ops to be added? why not just recover?
-      op := &Operation{
+      op := &op_log.Operation{
         Add: false,
         Key: args.Key,
         Nodes: []int{cc.me},
       }
       cc.ol.Append(op)
     } else {
-      value, exists = cc.cache[args.Key]
+      value, exists = cc.cache.Get(args.Key)
     }
 
     sendArgs := &SendKVPairArgs{
@@ -564,7 +567,7 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
         // delete from node's filter; append to operation log
         delete(cc.filters[args.Node], args.Key)
 
-        op := &Operation{
+        op := &op_log.Operation{
           Add: false,
           Key: args.Key,
           Nodes: []int{args.Node},
@@ -590,9 +593,9 @@ func (cc *CrowdControl) SendKVPair(args *SendKVPairArgs,
   // TODO: what are the other failure cases here?
 
   if !args.Exists {
-    delete(cc.cache, args.Key)
+    cc.cache.Delete(args.Key)
   } else {
-    cc.cache[args.Key] = args.Value
+    cc.cache.Set(args.Key, args.Value)
   }
 
   delete(cc.filters[cc.me], args.Key)
@@ -696,7 +699,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     return nil
   }
 
-  curValue, exists := cc.cache[key]
+  curValue, exists := cc.cache.Get(key)
   if exists && curValue == value {
     // already set this value (set likely in progress from earlier)
     response.Status = SET_SUCCESS
@@ -705,7 +708,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     return nil
   }
 
-  cc.cache[key] = value
+  cc.cache.Set(key, value)
   for i, _ := range cc.peers {
     cc.filters[i][key] = true
   }
@@ -714,7 +717,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   // compromise safety, since they will happen after the Prep() RPC
   savedLeasesUntil := append([]time.Time(nil), cc.grantedLeasesUntil...)
 
-  op := &Operation{Add: true, Key: key}
+  op := &op_log.Operation{Add: true, Key: key}
   cc.ol.Append(op)
 
   // TODO: add waiting for leases to expire
@@ -854,7 +857,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
       return
     }
 
-    op := &Operation{Add: false, Key: key, Nodes: committedNodes}
+    op := &op_log.Operation{Add: false, Key: key, Nodes: committedNodes}
     cc.ol.Append(op)
 
     cc.mutex.Unlock()
@@ -966,7 +969,7 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
 }
 
 
-func (cc *CrowdControl) performOp(op *Operation) {
+func (cc *CrowdControl) performOp(op *op_log.Operation) {
   if op.Add {
     // add operations apply to all nodes
     for node, _ := range cc.peers {
@@ -1006,7 +1009,7 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
   // KV pair has been received 
   delete(cc.inflightKeys, args.Key)
 
-  cc.cache[args.Key] = args.Value
+  cc.cache.Set(args.Key, args.Value)
   delete(cc.filters[cc.me], args.Key)
   // TODO: Need to garbage collect prepped somehow. We can't just delete
   // cc.prepped[args.Nonce] here because the response could get lost.
@@ -1072,7 +1075,7 @@ func (cc *CrowdControl) revokeLeases_mu(leasedNodes []int, view int) chan []*RPC
 /* Creates a CrowdControl peer. `peers` is an array of peers within the
  * cluster, where each element is a string representing a socket. `me` is the
  * index of this peer. */
-func (cc *CrowdControl) Init(peers []string, me int) {
+func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
   cc.peers = peers
   cc.numPeers = len(peers)
   cc.me = me
@@ -1101,14 +1104,15 @@ func (cc *CrowdControl) Init(peers []string, me int) {
   cc.scheduleElection()
   cc.scheduleHeartbeat()
 
-  cc.cache = make(map[string]string)
+  cc.cache = &cache.Cache{}
+  cc.cache.Init(capacity)
   cc.filters = make([]map[string]bool, cc.numPeers, cc.numPeers)
 
   for i := 0; i < cc.numPeers; i++ {
     cc.filters[i] = make(map[string]bool)
   }
 
-  cc.ol = &OperationLog{}
+  cc.ol = &op_log.OperationLog{}
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
 
   cc.setMutexes = make(map[string]*SetMutex)
