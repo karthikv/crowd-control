@@ -1,12 +1,7 @@
 package op_log
 
+import "log"
 
-/* Represents an add or remove operation to a node's filter. */
-type Operation struct {
-  Add bool  // whether this is an add or remove operation
-  Key string  // the key to add/remove
-  Nodes []int  // for remove ops, which nodes to remove from
-}
 
 type OperationLog struct {
   start int  // beginning of ring buffer
@@ -46,21 +41,32 @@ func (ol *OperationLog) updateStart() {
 }
 
 
-func (ol *OperationLog) Append(op *Operation)  {
+func (ol *OperationLog) Append(op Operation) {
   index := (ol.start + ol.length) % ol.capacity
 
   if ol.length == ol.capacity {
     ol.invalidateOldestNodes()
   }
 
-  ol.ops[index] = *op
+  ol.ops[index] = op
   ol.length += 1
 }
 
 
-func (ol *OperationLog) FastForward(node int) {
+func (ol *OperationLog) FastForward(node int, opNum int) {
+  if opNum < ol.opNums[node] {
+    log.Printf("Redundant fast-forward\n")
+    return
+  }
+
+  if opNum > ol.GetNextOpNum() {
+    log.Printf("Invalid fast-forward[%v] to %v, should be <= %v\n",
+      node, opNum, ol.GetNextOpNum())
+    return
+  }
+
   // if opNums[node] = n, node hasn't executed operation n and all future ops
-  ol.opNums[node] = (ol.start + ol.length)
+  ol.opNums[node] = opNum
 
   // maintain invariant oldest opNum == ol.start
   ol.updateStart()

@@ -10,8 +10,8 @@ import (
 
 
 func checkSize(t *testing.T, filter *Filter, size int) {
-  if filter.Size() != size {
-    t.Fatalf("Got size %v, expected %v\n", filter.Size(), size)
+  if filter.Size != size {
+    t.Fatalf("Got size %v, expected %v\n", filter.Size, size)
   }
 }
 
@@ -30,8 +30,8 @@ func TestAdd(t *testing.T) {
   capacity := 256
   filter.Init(capacity, 6)
 
-  if filter.Capacity() != capacity {
-    t.Fatalf("Got capacity %v, expected %v\n", filter.Capacity(), capacity)
+  if filter.Capacity != capacity {
+    t.Fatalf("Got capacity %v, expected %v\n", filter.Capacity, capacity)
   }
   checkSize(t, filter, 0)
 

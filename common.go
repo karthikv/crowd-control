@@ -115,7 +115,7 @@ type RequestVoteArgs struct {
   NextView int
   NextPrimary int
   View int
-  LatestOp int
+  NextOpNum int
 }
 
 type RequestVoteResponse struct {
@@ -138,7 +138,8 @@ type HeartbeatResponse struct {
 type PrepArgs struct {
   View int
   Invalid bool
-  Nonce int
+  StartOpNum int
+  NextOpNum int
   Key string
   Ops []op_log.Operation
 }
@@ -151,7 +152,7 @@ type PrepResponse struct {
 /* The Commit() RPC inserts/updates a key value pair. */
 type CommitArgs struct {
   View int
-  Nonce int
+  NextOpNum int
   Key string
   Value string
 }
@@ -172,7 +173,7 @@ type RequestLeaseArgs struct {
 
 type RequestLeaseResponse struct {
   Status byte
-  Filter map[string]bool
+  Filter op_log.Filter
   Until time.Time
 }
 

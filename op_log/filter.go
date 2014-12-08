@@ -1,9 +1,8 @@
 package op_log
 
 import (
-  "log"
-  "hash"
   "hash/fnv"
+  "crypto/sha256"
 )
 
 
@@ -21,14 +20,13 @@ const (
 
 /* Represents a counting bloom filter using 4 bits for each counter. */
 type Filter struct {
-  data []uint8  // actual bit data
-  numCounters int  // number of counters
+  Data []uint8  // actual bit data
 
-  size int
-  capacity int  // number of elements to hold
+  NumCounters int  // number of counters
+  NumHashes int  // number of hash functions to use
 
-  numHashes int  // number of hash functions to use
-  hash hash.Hash64
+  Size int  // how many elements are stored
+  Capacity int  // number of elements to hold
 }
 
 
@@ -39,14 +37,13 @@ func (filter *Filter) Add(key []byte) {
     filter.set(index, filter.get(index) + 1)
   }
 
-  filter.size += 1
+  filter.Size += 1
 }
 
 
 /* Removes a key from this filter. */
 func (filter *Filter) Remove(key []byte) {
   if !filter.Contains(key) {
-    log.Printf("Removing element that doesn't exist in filter.\n")
     return
   }
 
@@ -55,7 +52,7 @@ func (filter *Filter) Remove(key []byte) {
     filter.set(index, filter.get(index) - 1)
   }
 
-  filter.size -= 1
+  filter.Size -= 1
 }
 
 
@@ -72,32 +69,21 @@ func (filter *Filter) Contains(key []byte) bool {
 }
 
 
-/* Returns the number of items in this filter. */
-func (filter *Filter) Size() int {
-  return filter.size
-}
-
-
-/* Returns the capacity of the filter. */
-func (filter *Filter) Capacity() int {
-  return filter.capacity
-}
-
-
 /* Returns the counter indexes to increment for the given key. */
 func (filter *Filter) getCounterIndexes(key []byte) []int {
-  filter.hash.Reset()
-  filter.hash.Write(key)
+  hash := fnv.New64a()
+  hash.Reset()
+  hash.Write(key)
 
   // we can generate an arbitrary number of hash functions by taking the left
   // and right halves of an fnv hash and superimposing them
-  value := filter.hash.Sum64()
+  value := hash.Sum64()
   left := uint64(value & HASH_MASK)
   right := uint64((value >> HASH_OFFSET) & HASH_MASK)
 
-  counterIndexes := make([]int, filter.numHashes)
-  numHashes64 := uint64(filter.numHashes)
-  numCounters64 := uint64(filter.numCounters)
+  counterIndexes := make([]int, filter.NumHashes)
+  numHashes64 := uint64(filter.NumHashes)
+  numCounters64 := uint64(filter.NumCounters)
 
   for i := uint64(0); i < numHashes64; i++ {
     counterIndexes[i] = int((left + i * right) % numCounters64)
@@ -117,7 +103,7 @@ func (filter *Filter) getDataIndexOffset(counterIndex int) (int, uint8) {
 /* Gets the count at the given counter index. */
 func (filter *Filter) get(counterIndex int) uint8 {
   dataIndex, offset := filter.getDataIndexOffset(counterIndex)
-  return (filter.data[dataIndex] >> offset) & COUNTER_MASK
+  return (filter.Data[dataIndex] >> offset) & COUNTER_MASK
 }
 
 
@@ -130,19 +116,26 @@ func (filter *Filter) set(counterIndex int, value uint8) {
   dataIndex, offset := filter.getDataIndexOffset(counterIndex)
   clearMask := ^COUNTER_MASK
 
-  filter.data[dataIndex] &= (clearMask << offset)
-  filter.data[dataIndex] |= (value << offset)
+  filter.Data[dataIndex] &= (clearMask << offset)
+  filter.Data[dataIndex] |= (value << offset)
+}
+
+
+/* Returns a hash of this filter for comparison purposes. */
+func (filter *Filter) Hash() [sha256.Size]byte {
+  return sha256.Sum256(filter.Data)
 }
 
 
 /* Initializes this filter for use. */
 func (filter *Filter) Init(capacity int, numHashes int) {
-  filter.data = make([]uint8, capacity * COUNTERS_PER_ELEMENT / COUNTERS_PER_BYTE)
-  filter.numCounters = len(filter.data) * COUNTERS_PER_BYTE
+  // TODO: adjust counters per element
+  // TODO: adjust remove op functionality
+  filter.Data = make([]uint8, capacity * COUNTERS_PER_ELEMENT / COUNTERS_PER_BYTE)
+  filter.NumCounters = len(filter.Data) * COUNTERS_PER_BYTE
 
-  filter.size = 0
-  filter.capacity = capacity
+  filter.Size = 0
+  filter.Capacity = capacity
 
-  filter.numHashes = numHashes
-  filter.hash = fnv.New64a()
+  filter.NumHashes = numHashes
 }

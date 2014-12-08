@@ -10,6 +10,7 @@ import (
   "time"
   "errors"
   "crypto/sha256"
+  "encoding/gob"
 
   "./op_log"
   "./cache"
@@ -53,9 +54,14 @@ const (
 
   // max length of operation log
   OP_LOG_CAPACITY = 256
+
+  // counting bloom filter configuration
+  FILTER_CAPACITY = 256
+  FILTER_NUM_HASHES = 6
 )
 
 
+var ErrViewChange = errors.New("aborted due to view change")
 var ErrCouldNotGetLease = errors.New("could not get lease")
 
 
@@ -90,7 +96,7 @@ type CrowdControl struct {
   view int
   nextView int  // the next view number upon election timeout
   primary int
-  latestOp int  // used for determining up-to-dateness
+  nextOpNum int  // used for determining up-to-dateness
 
   // leader election
   votes map[int]int  // view -> which machine this peer votes for
@@ -101,16 +107,13 @@ type CrowdControl struct {
   cache *cache.Cache
 
   // whether the data for a given key on a given node is invalid
-  filters []map[string]bool
+  filters []*op_log.Filter
 
   // operation log
   ol *op_log.OperationLog
 
   // maintains key -> lock mappings; must lock a given key while setting
   setMutexes map[string]*SetMutex
-
-  // if we've prepped for a given nonce; nonce -> status mapping
-  prepped map[int]bool
 
   // last time the primary reached a majority of nodes
   reachedMajorityAt time.Time
@@ -267,13 +270,13 @@ func (cc *CrowdControl) scheduleElection() {
 
 
 func (cc *CrowdControl) attemptElection_ml() {
-  log.Printf("CC[%v] attempting election\n", cc.me)
+  log.Printf("CC[%v] attempting election for view %v\n", cc.me, cc.nextView)
   // try starting election if no initial view or if no recent heartbeat
   args := &RequestVoteArgs{
     NextView: cc.nextView,
     NextPrimary: cc.me,
     View: cc.view,
-    LatestOp: cc.latestOp,
+    NextOpNum: cc.nextOpNum,
   }
 
   numGranted := 0
@@ -351,8 +354,7 @@ func (cc *CrowdControl) setView_ml(view int, primary int) {
   cc.nextView = view + 1
 
   cc.primary = primary
-  cc.latestOp = 0
-
+  cc.nextOpNum = 0
   cc.lastHeartbeat = time.Now()
 
   // reset election timer (non-blocking)
@@ -363,7 +365,6 @@ func (cc *CrowdControl) setView_ml(view int, primary int) {
 
   cc.ol = &op_log.OperationLog{}
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
-  cc.prepped = make(map[int]bool)
 
   cc.reachedMajorityAt = time.Now()
   cc.leaseUntil = time.Now()
@@ -384,7 +385,7 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
   }
 
   vote, exists := cc.votes[args.NextView]
-  if cc.view == args.View && cc.latestOp > args.LatestOp {
+  if cc.view == args.View && cc.nextOpNum > args.NextOpNum {
     log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
     // node not up-to-date
     response.Status = VOTE_REFUSED
@@ -419,13 +420,22 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
       leaseArgs := &RequestLeaseArgs{
         View: cc.view,
         Node: cc.me,
-        FilterHash: cc.hashFilter(cc.filters[cc.me]),
+        FilterHash: cc.filters[cc.me].Hash(),
         Now: time.Now(),
       }
 
       ch := cc.rts[cc.primary].MakeRPCRetry("CrowdControl.RequestLease", &leaseArgs,
         &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
+
+      originalView := cc.view
+      cc.mutex.Unlock()
+
       reply := <-ch
+
+      cc.mutex.Lock()
+      if cc.view > originalView {
+        return ErrViewChange
+      }
 
       if reply.Success {
         leaseResponse := reply.Data.(*RequestLeaseResponse)
@@ -434,9 +444,9 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
         if leaseResponse.Status == LEASE_GRANTED {
           cc.leaseUntil = leaseResponse.Until
         } else if leaseResponse.Status == LEASE_REFUSED {
-          return errors.New("get aborted due to view change")
+          return ErrViewChange
         } else if leaseResponse.Status == LEASE_UPDATE_FILTER {
-          cc.filters[cc.me] = leaseResponse.Filter
+          cc.filters[cc.me] = &leaseResponse.Filter
           cc.leaseUntil = leaseResponse.Until
         }
       } else {
@@ -445,7 +455,7 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
     }
   }
 
-  if cc.filters[cc.me][args.Key] {
+  if cc.filters[cc.me].Contains([]byte(args.Key)) {
     // not up-to-date for this key
     response.Status = GET_DELAYED
 
@@ -521,18 +531,14 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
     var value string
     var exists bool
 
-    if cc.filters[cc.me][args.Key] {
+    if cc.filters[cc.me].Contains([]byte(args.Key)) {
       value, exists = "", false
       cc.cache.Delete(args.Key)
-      delete(cc.filters[cc.me], args.Key)
 
       // TODO: does this cause too many ops to be added? why not just recover?
-      op := &op_log.Operation{
-        Add: false,
-        Key: args.Key,
-        Nodes: []int{cc.me},
-      }
-      cc.ol.Append(op)
+      op := op_log.RemoveOperation{Key: args.Key, Nodes: []int{cc.me}}
+      cc.appendOp(op)
+      op.Perform(&cc.filters)
     } else {
       value, exists = cc.cache.Get(args.Key)
     }
@@ -564,15 +570,10 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
       sendResponse := reply.Data.(*SendKVPairResponse)
 
       if sendResponse.Status == SEND_KV_PAIR_SUCCESS {
-        // delete from node's filter; append to operation log
-        delete(cc.filters[args.Node], args.Key)
-
-        op := &op_log.Operation{
-          Add: false,
-          Key: args.Key,
-          Nodes: []int{args.Node},
-        }
-        cc.ol.Append(op)
+        // append to operation log; delete from node's filter
+        op := op_log.RemoveOperation{Key: args.Key, Nodes: []int{args.Node}}
+        cc.appendOp(op)
+        op.Perform(&cc.filters)
       }
     }
   }()
@@ -598,31 +599,15 @@ func (cc *CrowdControl) SendKVPair(args *SendKVPairArgs,
     cc.cache.Set(args.Key, args.Value)
   }
 
-  delete(cc.filters[cc.me], args.Key)
+  cc.filters[cc.me].Remove([]byte(args.Key))
   delete(cc.inflightKeys, args.Key)
 
   response.Status = SEND_KV_PAIR_SUCCESS
   return nil
 }
 
-func (cc *CrowdControl) hashFilter(filter map[string]bool) [sha256.Size]byte {
-  numBytes := 0
-  for key, _ := range filter {
-    numBytes += len(key)
-  }
-
-  // create array of bytes corresponding to keys
-  bytes := make([]byte, 0, numBytes)
-  for key, _ := range filter {
-    bytes = append(bytes, []byte(key)...)
-  }
-
-  return sha256.Sum256(bytes)
-}
-
-
 func (cc *CrowdControl) nodeHasFilterHash(node int, filterHash [sha256.Size]byte) bool {
-  hash := cc.hashFilter(cc.filters[node])
+  hash := cc.filters[node].Hash()
 
   if len(hash) != len(filterHash) {
     return false
@@ -649,8 +634,8 @@ func (cc *CrowdControl) RequestLease(args *RequestLeaseArgs,
   }
 
   if time.Now().Sub(cc.reachedMajorityAt) > ELECTION_TIMEOUT_MIN {
-    log.Printf("haven't reached majority\n")
     // haven't reached a majority of nodes for a while; might be partitioned
+    log.Printf("haven't reached majority\n")
     response.Status = LEASE_REFUSED
     return nil
   }
@@ -659,7 +644,7 @@ func (cc *CrowdControl) RequestLease(args *RequestLeaseArgs,
     response.Status = LEASE_GRANTED
   } else {
     response.Status = LEASE_UPDATE_FILTER
-    response.Filter = cc.filters[args.Node]
+    response.Filter = *cc.filters[args.Node]
   }
 
   response.Until = args.Now.Add(LEASE_DURATION)
@@ -709,25 +694,24 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   }
 
   cc.cache.Set(key, value)
-  for i, _ := range cc.peers {
-    cc.filters[i][key] = true
-  }
 
   // don't worry about leases changed during this set() operation; they don't
   // compromise safety, since they will happen after the Prep() RPC
   savedLeasesUntil := append([]time.Time(nil), cc.grantedLeasesUntil...)
 
-  op := &op_log.Operation{Add: true, Key: key}
-  cc.ol.Append(op)
+  op := op_log.AddOperation{Key: key}
+  cc.appendOp(op)
+  op.Perform(&cc.filters)
 
   // TODO: add waiting for leases to expire
   majority := false
-  nonce := cc.ol.GetNextOpNum()
   waitTime := WAIT_TIME_INITIAL
+  var nextOpNum int
 
   for !majority {
     numPrepped := 0
     refused := false
+    nextOpNum = cc.ol.GetNextOpNum()
 
     // TODO: either throttle RPC retries or just error, expecting client retry
     rpcCh := makeParallelRPCs(cc.nodes,
@@ -737,7 +721,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
         args := &PrepArgs{
           View: cc.view,
           Invalid: invalid,
-          Nonce: nonce,
+          StartOpNum: nextOpNum - len(ops),
+          NextOpNum: nextOpNum,
           Key: key,
           Ops: ops,
         }
@@ -775,7 +760,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     originalView := cc.view
     cc.mutex.Unlock()
 
-    // wait for replies; don't block get requests
+    // wait for replies; don't block other requests
     replies := <-rpcCh
 
     cc.mutex.Lock()
@@ -785,24 +770,35 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
       // we've made a transition to a new view; don't proceed
       cc.mutex.Unlock()
       cc.releaseSetMutex(key, setMutex)
-      return errors.New("set aborted due to view change")
+      return ErrViewChange
     }
 
     majority = (numPrepped > cc.numPeers / 2)
     if majority {
       for _, reply := range replies {
-        if reply.Success && reply.Data.(*PrepResponse).Status == PREP_SUCCESS {
-          cc.ol.FastForward(reply.Node)
+        if reply.Success && reply.Data.(*PrepResponse).Status == PREP_SUCCESS &&
+            reply.Node != cc.me {
+          cc.ol.FastForward(reply.Node, nextOpNum)
         }
       }
 
       // successfully prepped
       // log.Printf("CC[%v] set by %v/%v peers\n", cc.me, numPrepped, cc.numPeers)
     } else {
+      cc.mutex.Unlock()
+
       // throttle requests
       time.Sleep(waitTime)
       if waitTime < WAIT_TIME_MAX {
         waitTime *= WAIT_TIME_MULTIPLICATIVE_INCREASE
+      }
+
+      cc.mutex.Lock()
+      if cc.view > originalView {
+        // we've made a transition to a new view; don't proceed
+        cc.mutex.Unlock()
+        cc.releaseSetMutex(key, setMutex)
+        return ErrViewChange
       }
     }
   }
@@ -810,8 +806,6 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   commitDoneCh := make(chan bool, 1)
   go func() {
     cc.mutex.Lock()
-
-    originalView := cc.view
     committedNodes := make([]int, 0, cc.numPeers)
 
     rpcCh := makeParallelRPCs(cc.nodes,
@@ -821,8 +815,9 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           View: cc.view,
           Key: key,
           Value: value,
-          Nonce: nonce,
+          NextOpNum: nextOpNum,
         }
+
         response := &CommitResponse{}
         return cc.rts[node].MakeRPCRetry("CrowdControl.Commit", args, response,
           int(COMMIT_RPCS_TIMEOUT / RPC_TIMEOUT))
@@ -838,13 +833,14 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
           // compute number of granted and already granted votes
           commitResponse := reply.Data.(*CommitResponse)
           if commitResponse.Success {
-            delete(cc.filters[reply.Node], key)
+            cc.filters[reply.Node].Remove([]byte(key))
             committedNodes = append(committedNodes, reply.Node)
           }
         }
         return false
       }, COMMIT_RPCS_TIMEOUT)
 
+    originalView := cc.view
     cc.mutex.Unlock()
 
     <-rpcCh
@@ -857,8 +853,8 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
       return
     }
 
-    op := &op_log.Operation{Add: false, Key: key, Nodes: committedNodes}
-    cc.ol.Append(op)
+    op := op_log.RemoveOperation{Key: key, Nodes: committedNodes}
+    cc.appendOp(op)
 
     cc.mutex.Unlock()
     commitDoneCh <- true
@@ -893,7 +889,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
 
   cc.mutex.Lock()
   if cc.view > originalView {
-    return errors.New("set aborted due to view change")
+    return ErrViewChange
   }
   cc.mutex.Unlock()
 
@@ -946,41 +942,28 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
     return nil
   }
 
-  if cc.prepped[args.Nonce] {
-    response.Status = PREP_SUCCESS
+  startIndex := cc.nextOpNum - args.StartOpNum
+  if startIndex < 0 {
+    // TODO: must recover
+    response.Status = PREP_DELAYED
     return nil
   }
 
   numOps := len(args.Ops)
-  for i := 0; i < numOps; i++ {
-    cc.performOp(&args.Ops[i])
+  for i := startIndex; i < numOps; i++ {
+    args.Ops[i].Perform(&cc.filters)
   }
 
   // key will take time to commit; don't allow an incoming get request to
   // trigger a RequestKVPair() RPC
   cc.inflightKeys[args.Key] = time.Now()
 
-  // nonce is the op number
-  cc.latestOp = args.Nonce
+  if cc.nextOpNum < args.NextOpNum {
+    cc.nextOpNum = args.NextOpNum
+  }
 
-  cc.prepped[args.Nonce] = true
   response.Status = PREP_SUCCESS
   return nil
-}
-
-
-func (cc *CrowdControl) performOp(op *op_log.Operation) {
-  if op.Add {
-    // add operations apply to all nodes
-    for node, _ := range cc.peers {
-      cc.filters[node][op.Key] = true
-    }
-  } else {
-    // remove operations apply to nodes in op.Nodes
-    for node, _ := range op.Nodes {
-      delete(cc.filters[node], op.Key)
-    }
-  }
 }
 
 
@@ -1000,8 +983,8 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
     return nil
   }
 
-  if !cc.prepped[args.Nonce] {
-    // can't commit if we didn't prep; need to get up-to-date
+  if cc.nextOpNum < args.NextOpNum {
+    // can't commit if we aren't up-to-date
     response.Success = false
     return nil
   }
@@ -1010,16 +993,19 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
   delete(cc.inflightKeys, args.Key)
 
   cc.cache.Set(args.Key, args.Value)
-  delete(cc.filters[cc.me], args.Key)
-  // TODO: Need to garbage collect prepped somehow. We can't just delete
-  // cc.prepped[args.Nonce] here because the response could get lost.
-  // Perhaps if we associate nonces with the log, we can delete a nonce
-  // as soon as we see a remove operation for it. More simply, we could
-  // just keep hold of the latest N preps, and delete after that
-  // (sufficiently low probability that prep will come up again)
+  cc.filters[cc.me].Remove([]byte(args.Key))
 
   response.Success = true
   return nil
+}
+
+
+func (cc *CrowdControl) appendOp(op op_log.Operation) {
+  cc.ol.Append(op)
+
+  // primary is always up-to-date
+  cc.nextOpNum = cc.ol.GetNextOpNum()
+  cc.ol.FastForward(cc.me, cc.nextOpNum)
 }
 
 
@@ -1095,7 +1081,7 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
   cc.view = -1
   cc.nextView = 0
   cc.primary = -1
-  cc.latestOp = 0
+  cc.nextOpNum = 0
 
   cc.votes = make(map[int]int)
   cc.lastHeartbeat = time.Now()
@@ -1106,18 +1092,17 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
 
   cc.cache = &cache.Cache{}
   cc.cache.Init(capacity)
-  cc.filters = make([]map[string]bool, cc.numPeers, cc.numPeers)
+  cc.filters = make([]*op_log.Filter, cc.numPeers, cc.numPeers)
 
   for i := 0; i < cc.numPeers; i++ {
-    cc.filters[i] = make(map[string]bool)
+    cc.filters[i] = &op_log.Filter{}
+    cc.filters[i].Init(FILTER_CAPACITY, FILTER_NUM_HASHES)
   }
 
   cc.ol = &op_log.OperationLog{}
   cc.ol.Init(OP_LOG_CAPACITY, cc.numPeers)
 
   cc.setMutexes = make(map[string]*SetMutex)
-  cc.prepped = make(map[int]bool)
-
   cc.reachedMajorityAt = time.Now()
   cc.leaseUntil = time.Now()
 
@@ -1127,6 +1112,10 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
   }
 
   cc.inflightKeys = make(map[string]time.Time)
+
+  gob.Register(op_log.AddOperation{})
+  gob.Register(op_log.RemoveOperation{})
+  gob.Register(op_log.SetFilterOperation{})
 
   rpcServer := rpc.NewServer()
   rpcServer.Register(cc)

@@ -11,11 +11,11 @@ func TestAppend(t *testing.T) {
   capacity := 256
   ol.Init(capacity, 1)
 
-  ops := make([]*Operation, capacity, capacity)
+  ops := make([]Operation, capacity, capacity)
 
   for i := 0; i < capacity; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: false, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
@@ -24,8 +24,8 @@ func TestAppend(t *testing.T) {
   }
 
   for i := 0; i < capacity; i++ {
-    if ol.ops[i].Key != ops[i].Key {
-      t.Fatalf("Invalid key %v, expected %v\n", ol.ops[i].Key, ops[i].Key)
+    if ol.ops[i] != ops[i] {
+      t.Fatalf("Invalid op %v, expected %v\n", ol.ops[i], ops[i])
     }
   }
 }
@@ -37,7 +37,7 @@ func TestFastForward(t *testing.T) {
   ol.Init(capacity, 1)
 
   for i := 0; i < capacity - 100; i++ {
-    op := &Operation{Add: true, Key: "k"}
+    op := AddOperation{Key: "k"}
     ol.Append(op)
   }
 
@@ -45,14 +45,14 @@ func TestFastForward(t *testing.T) {
     t.Fatalf("Invalid length after inserting\n")
   }
 
-  ol.FastForward(0)
+  ol.FastForward(0, capacity - 100)
 
   if ol.length != 0 {
     t.Fatalf("Invalid length after fast forward\n")
   }
 
   for i := 0; i < 150; i++ {
-    op := &Operation{Add: true, Key: "k"}
+    op := AddOperation{Key: "k"}
     ol.Append(op)
   }
 
@@ -62,7 +62,7 @@ func TestFastForward(t *testing.T) {
 }
 
 
-func checkPending(t *testing.T, ol *OperationLog, node int, ops []*Operation,
+func checkPending(t *testing.T, ol *OperationLog, node int, ops []Operation,
     shouldBeInvalid bool) {
   invalid, pending := ol.GetPending(node)
 
@@ -78,8 +78,8 @@ func checkPending(t *testing.T, ol *OperationLog, node int, ops []*Operation,
   }
 
   for i, op := range pending {
-    if op.Key != ops[i].Key {
-      t.Fatalf("Invalid op, got %v expected %v\n", op.Key, ops[i].Key)
+    if op != ops[i] {
+      t.Fatalf("Invalid op, got %v expected %v\n", op, ops[i])
     }
   }
 }
@@ -91,11 +91,11 @@ func TestGetPending(t *testing.T) {
   ol.Init(capacity, 1)
 
   numAppend := capacity - 100
-  ops := make([]*Operation, capacity, capacity)
+  ops := make([]Operation, capacity, capacity)
 
   for i := 0; i < numAppend; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: true, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
@@ -107,13 +107,13 @@ func TestGetPending(t *testing.T) {
 
   for i := numAppend; i < capacity; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: true, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
   checkPending(t, ol, 0, ops, false)
 
-  overflowOp := &Operation{Add: false, Key: "overflow"}
+  overflowOp := AddOperation{Key: "overflow"}
   ol.Append(overflowOp)
 
   checkPending(t, ol, 0, ops, true)
@@ -124,15 +124,15 @@ func TestIntegration(t *testing.T) {
   capacity := 256
   ol.Init(capacity, 3)
 
-  ops := make([]*Operation, 300, 300)
+  ops := make([]Operation, 300, 300)
 
   for i := 0; i < 100; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: true, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
-  ol.FastForward(0)
+  ol.FastForward(0, 100)
 
   if ol.length != 100 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -140,11 +140,11 @@ func TestIntegration(t *testing.T) {
 
   for i := 100; i < 200; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: true, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
-  ol.FastForward(1)
+  ol.FastForward(1, 200)
 
   if ol.length != 200 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -160,7 +160,7 @@ func TestIntegration(t *testing.T) {
 
   for i := 200; i < 300; i++ {
     key := fmt.Sprintf("%v", i)
-    ops[i] = &Operation{Add: true, Key: key}
+    ops[i] = AddOperation{Key: key}
     ol.Append(ops[i])
   }
 
@@ -172,7 +172,7 @@ func TestIntegration(t *testing.T) {
   checkPending(t, ol, 1, ops[200:300], false)
   checkPending(t, ol, 2, ops, true)
 
-  ol.FastForward(0)
+  ol.FastForward(0, 300)
 
   if ol.length != 100 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -187,7 +187,7 @@ func TestIntegration(t *testing.T) {
   checkPending(t, ol, 2, ops, true)
 
   // should be idempotent
-  ol.FastForward(0)
+  ol.FastForward(0, 300)
 
   if ol.length != 100 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -197,7 +197,7 @@ func TestIntegration(t *testing.T) {
   checkPending(t, ol, 1, ops[200:300], false)
   checkPending(t, ol, 2, ops, true)
 
-  ol.FastForward(2)
+  ol.FastForward(2, 300)
 
   if ol.length != 100 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -211,7 +211,7 @@ func TestIntegration(t *testing.T) {
   checkPending(t, ol, 1, ops[200:300], false)
   checkPending(t, ol, 2, ops[300:300], false)
 
-  ol.FastForward(1)
+  ol.FastForward(1, 300)
 
   if ol.length != 0 {
     t.Fatalf("Invalid length after single fast forward\n")
@@ -226,7 +226,7 @@ func TestIntegration(t *testing.T) {
   checkPending(t, ol, 2, ops[300:300], false)
 
   // should be idempotent
-  ol.FastForward(1)
+  ol.FastForward(1, 300)
 
   if ol.length != 0 {
     t.Fatalf("Invalid length after single fast forward\n")
