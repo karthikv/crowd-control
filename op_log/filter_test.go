@@ -117,11 +117,7 @@ func TestRemove(t *testing.T) {
   checkSize(t, filter, 3)
   checkCount(t, filter, "bar", 2)
 
-  filter.Remove([]byte("bar"))
-  checkContains(t, filter, "bar", true)
-  checkSize(t, filter, 2)
-  checkCount(t, filter, "bar", 1)
-
+  // remove should get rid of bar entirely
   filter.Remove([]byte("bar"))
   checkContains(t, filter, "bar", false)
   checkSize(t, filter, 1)

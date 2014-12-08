@@ -9,7 +9,7 @@ import (
 const (
   BITS_PER_COUNTER = 4
 
-  COUNTERS_PER_ELEMENT = 8
+  COUNTERS_PER_ELEMENT = 12
   COUNTERS_PER_BYTE = 2
   COUNTER_MASK = byte(0xf)
 
@@ -43,16 +43,15 @@ func (filter *Filter) Add(key []byte) {
 
 /* Removes a key from this filter. */
 func (filter *Filter) Remove(key []byte) {
-  if !filter.Contains(key) {
-    return
-  }
+  // remove keeps removing until the key is gone from the filter
+  for filter.Contains(key) {
+    counterIndexes := filter.getCounterIndexes(key)
+    for _, index := range counterIndexes {
+      filter.set(index, filter.get(index) - 1)
+    }
 
-  counterIndexes := filter.getCounterIndexes(key)
-  for _, index := range counterIndexes {
-    filter.set(index, filter.get(index) - 1)
+    filter.Size -= 1
   }
-
-  filter.Size -= 1
 }
 
 
