@@ -65,9 +65,6 @@ var ErrViewChange = errors.New("aborted due to view change")
 var ErrCouldNotGetLease = errors.New("could not get lease")
 
 
-// TODO: handle eviction
-
-
 /* Represents a mutex along with its number of users. */
 type SetMutex struct {
   Mutex sync.Mutex
@@ -420,47 +417,41 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   defer cc.mutex.Unlock()
 
   if cc.leaseUntil.Sub(time.Now()) <= 0 {
-    if cc.primary == cc.me {
-      // TODO: handle network partition case here
-      // primary can extend its own lease
-      cc.leaseUntil = time.Now().Add(LEASE_DURATION)
-    } else {
-      // must get lease from primary
-      leaseArgs := &RequestLeaseArgs{
-        View: cc.view,
-        Node: cc.me,
-        FilterHash: cc.filters[cc.me].Hash(),
-        Now: time.Now(),
-      }
+    // must get lease from primary
+    leaseArgs := &RequestLeaseArgs{
+      View: cc.view,
+      Node: cc.me,
+      FilterHash: cc.filters[cc.me].Hash(),
+      Now: time.Now(),
+    }
 
-      ch := cc.rts[cc.primary].MakeRPCRetry("CrowdControl.RequestLease", &leaseArgs,
-        &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
+    ch := cc.rts[cc.primary].MakeRPCRetry("CrowdControl.RequestLease", &leaseArgs,
+      &RequestLeaseResponse{}, SERVER_RPC_RETRIES)
 
-      originalView := cc.view
-      cc.mutex.Unlock()
+    originalView := cc.view
+    cc.mutex.Unlock()
 
-      reply := <-ch
+    reply := <-ch
 
-      cc.mutex.Lock()
-      if cc.view > originalView {
+    cc.mutex.Lock()
+    if cc.view > originalView {
+      return ErrViewChange
+    }
+
+    if reply.Success {
+      leaseResponse := reply.Data.(*RequestLeaseResponse)
+
+      // TODO: case where filter is too full; need to recover?
+      if leaseResponse.Status == LEASE_GRANTED {
+        cc.leaseUntil = leaseResponse.Until
+      } else if leaseResponse.Status == LEASE_REFUSED {
         return ErrViewChange
+      } else if leaseResponse.Status == LEASE_UPDATE_FILTER {
+        cc.filters[cc.me] = &leaseResponse.Filter
+        cc.leaseUntil = leaseResponse.Until
       }
-
-      if reply.Success {
-        leaseResponse := reply.Data.(*RequestLeaseResponse)
-
-        // TODO: case where filter is too full; need to recover?
-        if leaseResponse.Status == LEASE_GRANTED {
-          cc.leaseUntil = leaseResponse.Until
-        } else if leaseResponse.Status == LEASE_REFUSED {
-          return ErrViewChange
-        } else if leaseResponse.Status == LEASE_UPDATE_FILTER {
-          cc.filters[cc.me] = &leaseResponse.Filter
-          cc.leaseUntil = leaseResponse.Until
-        }
-      } else {
-        return ErrCouldNotGetLease
-      }
+    } else {
+      return ErrCouldNotGetLease
     }
   }
 
