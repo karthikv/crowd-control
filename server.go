@@ -384,16 +384,15 @@ func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVote
 
   if cc.view > args.View || cc.view >= args.NextView || time.Now().
       Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN {
-    // log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
-    // TODO: inform requester of view update
+    log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
     response.Status = VOTE_REFUSED
     return nil
   }
 
   vote, exists := cc.votes[args.NextView]
   if cc.view == args.View && cc.nextOpNum > args.NextOpNum {
-    log.Printf("CC[%v] vote refused for %v\n", cc.me, args.NextPrimary)
     // node not up-to-date
+    log.Printf("CC[%v] vote refused for out-of-date node %v\n", cc.me, args.NextPrimary)
     response.Status = VOTE_REFUSED
   } else if exists {
     if vote == args.NextPrimary {
@@ -534,7 +533,6 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
       value, exists = "", false
       cc.cache.Delete(args.Key)
 
-      // TODO: does this cause too many ops to be added? why not just recover?
       op := op_log.RemoveOperation{Key: args.Key, Nodes: []int{cc.me}}
       cc.appendOp(op)
       op.Perform(&cc.filters)
