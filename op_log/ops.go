@@ -35,7 +35,7 @@ func (remove RemoveOperation) Perform(filters *[]*Filter) {
 
 
 type SetFilterOperation struct {
-  Filters []*Filter
+  Filters []Filter
   Nodes []int
 }
 
@@ -43,6 +43,6 @@ type SetFilterOperation struct {
 /* Sets the filters of the given nodes. */
 func (setFilter SetFilterOperation) Perform(filters *[]*Filter) {
   for i, node := range setFilter.Nodes {
-    (*filters)[node] = setFilter.Filters[i]
+    (*filters)[node] = &setFilter.Filters[i]
   }
 }

@@ -341,6 +341,15 @@ func (cc *CrowdControl) attemptElection_ml() {
       log.Printf("CC[%v] elected by %v/%v peers\n", cc.me, numGranted, cc.numPeers)
       // have a majority of votes
       cc.setView_ml(cc.nextView, cc.me)
+
+      // sync all filters to begin this view
+      filters := make([]op_log.Filter, cc.numPeers)
+      for i := 0; i < cc.numPeers; i++ {
+        filters[i] = *cc.filters[i]
+      }
+
+      op := op_log.SetFilterOperation{Nodes: cc.nodes, Filters: filters}
+      cc.appendOp(op)
     } else if numRefused == 0 && numGranted + numAlreadyGranted > cc.numPeers / 2 {
       // contention between multiple nodes to become leader; try next view number
       cc.nextView += 1
