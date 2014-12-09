@@ -523,7 +523,6 @@ func (cc *CrowdControl) RequestKVPair(args *RequestKVPairArgs,
     response.Status = REQUEST_KV_PAIR_REFUSED
     return nil
   }
-  // TODO: what are the other cases in which a refusal should happen?
 
   response.Status = REQUEST_KV_PAIR_SUCCESS
   go func() {
@@ -591,7 +590,6 @@ func (cc *CrowdControl) SendKVPair(args *SendKVPairArgs,
     response.Status = SEND_KV_PAIR_REFUSED
     return nil
   }
-  // TODO: what are the other failure cases here?
 
   if !args.Exists {
     cc.cache.Delete(args.Key)
@@ -663,7 +661,6 @@ func (cc *CrowdControl) RevokeLease(args *RevokeLeaseArgs,
     return nil
   }
 
-  // TODO: confirm primary
   // invalidate lease
   cc.leaseUntil = time.Now()
   response.Success = true
@@ -703,7 +700,6 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
   cc.appendOp(op)
   op.Perform(&cc.filters)
 
-  // TODO: add waiting for leases to expire
   majority := false
   waitTime := WAIT_TIME_INITIAL
   var nextOpNum int
@@ -713,7 +709,6 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     refused := false
     nextOpNum = cc.ol.GetNextOpNum()
 
-    // TODO: either throttle RPC retries or just error, expecting client retry
     rpcCh := makeParallelRPCs(cc.nodes,
       // sends a Prep RPC to the given peer
       func(node int) chan *RPCReply {
@@ -766,7 +761,6 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
     cc.mutex.Lock()
 
     if cc.view > originalView || refused {
-      // TODO: handle refused more explicitly?
       // we've made a transition to a new view; don't proceed
       cc.mutex.Unlock()
       cc.releaseSetMutex(key, setMutex)
@@ -936,14 +930,13 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
     return nil
   }
 
-  if cc.view < args.View || args.Invalid {
-    // TODO: somehow update my view?
+  if cc.view < args.View {
     response.Status = PREP_DELAYED
     return nil
   }
 
   startIndex := cc.nextOpNum - args.StartOpNum
-  if startIndex < 0 {
+  if args.Invalid || startIndex < 0 {
     // TODO: must recover
     response.Status = PREP_DELAYED
     return nil
@@ -971,14 +964,7 @@ func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
-  if cc.view > args.View {
-    // TODO: inform of new view?
-    response.Success = false
-    return nil
-  }
-
-  if cc.view < args.View {
-    // TODO: somehow update my view?
+  if cc.view != args.View {
     response.Success = false
     return nil
   }

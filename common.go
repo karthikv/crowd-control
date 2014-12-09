@@ -159,7 +159,6 @@ type CommitArgs struct {
 
 type CommitResponse struct {
   Success bool
-  // TODO: add evicted keys
 }
 
 
@@ -326,7 +325,6 @@ func (rt *RPCTarget) MakeRPC(name string, args interface{},
 }
 
 
-// TODO: should numRetries be a param?
 /* Makes an RPC, as per `makeRPC`. Retries `numRetries` times. */
 func (rt *RPCTarget) MakeRPCRetry(name string, args interface{},
     response interface{}, numRetries int) chan *RPCReply {
@@ -363,7 +361,6 @@ type replyRPCFn func(*RPCReply) bool
  * (b) `replyCb` returns true, indicating that we should stop processing [or]
  * (c) `timeout` elapses
  */
- // TODO: make arrays pointers?
 func makeParallelRPCs(nodes []int, sendCb sendRPCFn, replyCb replyRPCFn,
     timeout time.Duration) chan []*RPCReply {
   numNodes := len(nodes)

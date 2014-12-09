@@ -128,8 +128,6 @@ func (filter *Filter) Hash() [sha256.Size]byte {
 
 /* Initializes this filter for use. */
 func (filter *Filter) Init(capacity int, numHashes int) {
-  // TODO: adjust counters per element
-  // TODO: adjust remove op functionality
   filter.Data = make([]uint8, capacity * COUNTERS_PER_ELEMENT / COUNTERS_PER_BYTE)
   filter.NumCounters = len(filter.Data) * COUNTERS_PER_BYTE
 
