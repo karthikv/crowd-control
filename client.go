@@ -43,9 +43,9 @@ func (client *Client) Get(key string) (string, bool) {
     outCh := make(chan *GetResponse, len(servers))
 
     // make RPCs to servers in parallel
-    for i, _ := range servers {
-      go func(i int) {
-        ch := client.rts[i].MakeRPC("CrowdControl.Get", args, &GetResponse{})
+    for _, node := range servers {
+      go func(node int) {
+        ch := client.rts[node].MakeRPC("CrowdControl.Get", args, &GetResponse{})
         reply := <-ch
 
         if reply.Success {
@@ -62,22 +62,22 @@ func (client *Client) Get(key string) (string, bool) {
         if reply.Success {
           getResponse := reply.Data.(*GetResponse)
           if getResponse.Status == GET_SUCCESS {
-            client.weights[i] *= WEIGHT_MULTIPLICATIVE_FACTOR
+            client.weights[node] *= WEIGHT_MULTIPLICATIVE_FACTOR
           } else {
-            client.weights[i] += WEIGHT_ADDITIVE_DECREASE
+            client.weights[node] += WEIGHT_ADDITIVE_DECREASE
           }
         } else {
-          client.weights[i] /= WEIGHT_MULTIPLICATIVE_FACTOR
+          client.weights[node] /= WEIGHT_MULTIPLICATIVE_FACTOR
         }
 
-        if client.weights[i] < WEIGHT_MIN {
-          client.weights[i] = WEIGHT_MIN
+        if client.weights[node] < WEIGHT_MIN {
+          client.weights[node] = WEIGHT_MIN
         }
 
-        if client.weights[i] > WEIGHT_MAX {
-          client.weights[i] = WEIGHT_MAX
+        if client.weights[node] > WEIGHT_MAX {
+          client.weights[node] = WEIGHT_MAX
         }
-      }(i)
+      }(node)
     }
 
     select {
