@@ -42,6 +42,7 @@ func (client *Client) Get(key string) (string, bool) {
     servers := client.pickServers(1)
     outCh := make(chan *GetResponse, len(servers))
 
+    // make RPCs to servers in parallel
     for i, _ := range servers {
       go func(i int) {
         ch := client.rts[i].MakeRPC("CrowdControl.Get", args, &GetResponse{})
@@ -57,6 +58,7 @@ func (client *Client) Get(key string) (string, bool) {
         client.weightMutex.Lock()
         defer client.weightMutex.Unlock()
 
+        // update weights based on response
         if reply.Success {
           getResponse := reply.Data.(*GetResponse)
           if getResponse.Status == GET_SUCCESS {
@@ -167,6 +169,7 @@ func (client *Client) Set(key string, value string) {
 
       <-ch
     } else {
+      // we know the primary; only send the request to it
       response := &SetResponse{}
       ch := client.rts[client.primary].MakeRPCRetry("CrowdControl.Set", args,
         response, CLIENT_RPC_RETRIES)
