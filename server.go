@@ -65,7 +65,6 @@ var ErrViewChange = errors.New("aborted due to view change")
 var ErrCouldNotGetLease = errors.New("could not get lease")
 
 
-// TODO: add random seed later
 // TODO: handle eviction
 
 
@@ -83,6 +82,7 @@ type CrowdControl struct {
   listener net.Listener
 
   dead bool  // used by testing framework to determine if this node is dead
+  rand *rand.Rand  // to generate random numbers
 
   // set of machines within the cluster
   peers []string  // node -> unix socket string
@@ -245,7 +245,7 @@ func (cc *CrowdControl) scheduleElection() {
   go func() {
     for {
       // attempt an election after a random timeout
-      timeout := (rand.Int63() % (ELECTION_TIMEOUT_MAX_INT - ELECTION_TIMEOUT_MIN_INT) +
+      timeout := (cc.rand.Intn(ELECTION_TIMEOUT_MAX_INT - ELECTION_TIMEOUT_MIN_INT) +
         ELECTION_TIMEOUT_MIN_INT)
 
       select {
@@ -1071,6 +1071,9 @@ func (cc *CrowdControl) revokeLeases_mu(leasedNodes []int, view int) chan []*RPC
  * cluster, where each element is a string representing a socket. `me` is the
  * index of this peer. */
 func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
+  source := rand.NewSource(time.Now().UnixNano())
+  cc.rand = rand.New(source)
+
   cc.peers = peers
   cc.numPeers = len(peers)
   cc.me = me
