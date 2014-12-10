@@ -11,7 +11,7 @@ const (
   USE_UNIX_SOCKETS = false
 
   // time to wait for RPCs
-  RPC_TIMEOUT = 10 * time.Millisecond
+  RPC_TIMEOUT = 30 * time.Millisecond
 
   // time to wait before retrying parallel RPCs
   WAIT_TIME_INITIAL = 1 * time.Millisecond

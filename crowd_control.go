@@ -26,7 +26,7 @@ const (
   ELECTION_RPCS_TIMEOUT = 100 * time.Millisecond
 
   // time between heartbeats
-  HEARTBEAT_TIMEOUT = 20 * time.Millisecond
+  HEARTBEAT_TIMEOUT = 30 * time.Millisecond
 
   // time to wait for heartbeat responses
   HEARTBEAT_RPCS_TIMEOUT = HEARTBEAT_TIMEOUT

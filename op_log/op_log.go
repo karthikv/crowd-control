@@ -55,7 +55,7 @@ func (ol *OperationLog) Append(op Operation) {
 
 func (ol *OperationLog) FastForward(node int, opNum int) {
   if opNum < ol.opNums[node] {
-    log.Printf("Redundant fast-forward\n")
+    // log.Printf("Redundant fast-forward\n")
     return
   }
 
