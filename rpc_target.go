@@ -198,6 +198,7 @@ func makeParallelRPCs(nodes []int, sendCb sendRPCFn, replyCb replyRPCFn,
   processedCh := make(chan bool)
 
   go func() {
+    ReplyLoop:
     for i := 0; i < numNodes; i += 1 {
       select {
       case reply := <-replyCh:
@@ -205,10 +206,10 @@ func makeParallelRPCs(nodes []int, sendCb sendRPCFn, replyCb replyRPCFn,
 
         replies = append(replies, reply)
         if stop {
-          break
+          break ReplyLoop
         }
       case <-doneCh:
-        break
+        break ReplyLoop
       }
     }
 
