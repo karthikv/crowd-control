@@ -80,7 +80,7 @@ func (cc *CrowdControl) Set(args *SetArgs, response *SetResponse) error {
             numPrepped += 1
 
             if numPrepped > cc.numPeers / 2 {
-              return true
+              // return true
             }
           } else if prepResponse.Status == PREP_REFUSED {
             refused = true
