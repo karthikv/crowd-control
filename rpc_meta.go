@@ -199,3 +199,26 @@ type RevokeLeaseArgs struct {
 type RevokeLeaseResponse struct {
   Success bool
 }
+
+
+/* The RequestRecovery() RPC requests the primary to recover this node. */
+type RequestRecoveryArgs struct {
+  View int
+  Node int
+}
+
+type RequestRecoveryResponse struct {
+  Success bool
+}
+
+
+/* The Recover() RPC recovers a node. */
+type RecoverArgs struct {
+  View int
+  Pairs map[string]string
+  Filters []op_log.Filter
+}
+
+type RecoverResponse struct {
+  Success bool
+}

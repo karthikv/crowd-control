@@ -116,6 +116,45 @@ func (cc *CrowdControl) Heartbeat(args *HeartbeatArgs, response *HeartbeatRespon
   default:
   }
 
+  // handle recovery in the background
+  if cc.recovering && time.Now().Sub(cc.lastRecoveryRequest) >
+      RECOVERY_REQUEST_TIMEOUT {
+    go func() {
+      cc.mutex.Lock()
+
+      if cc.recovering && time.Now().Sub(cc.lastRecoveryRequest) >
+          RECOVERY_REQUEST_TIMEOUT {
+        log.Printf("Making recovery request\n")
+        args := &RequestRecoveryArgs{
+          View: cc.view,
+          Node: cc.me,
+        }
+
+        ch := cc.rts[cc.primary].MakeRPCRetry("CrowdControl.RequestRecovery", &args,
+          &RequestRecoveryResponse{}, SERVER_RPC_RETRIES)
+
+        originalView := cc.view
+        cc.mutex.Unlock()
+
+        reply := <-ch
+
+        cc.mutex.Lock()
+        if cc.view != originalView {
+          return
+        }
+
+        if reply.Success {
+          recoveryResponse := reply.Data.(*RequestRecoveryResponse)
+          if recoveryResponse.Success {
+            cc.lastRecoveryRequest = time.Now()
+          }
+        }
+      }
+
+      cc.mutex.Unlock()
+    }()
+  }
+
   response.Success = true
   return nil
 }
@@ -136,7 +175,7 @@ func (cc *CrowdControl) scheduleElection() {
           return
         }
 
-        if cc.primary != cc.me {
+        if cc.primary != cc.me && !cc.recovering {
           cc.attemptElection_ml()
         }
         cc.mutex.Unlock()
@@ -264,6 +303,10 @@ func (cc *CrowdControl) setView_ml(view int, primary int) {
 func (cc *CrowdControl) RequestVote(args *RequestVoteArgs, response *RequestVoteResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
+
+  if cc.recovering {
+    return ErrRecovering
+  }
 
   if cc.view > args.View || cc.view >= args.NextView || time.Now().
       Sub(cc.lastHeartbeat) < ELECTION_TIMEOUT_MIN {

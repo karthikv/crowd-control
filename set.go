@@ -265,6 +265,10 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
+  if cc.recovering {
+    return ErrRecovering
+  }
+
   if cc.view > args.View {
     response.Status = PREP_REFUSED
     return nil
@@ -304,6 +308,10 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
 func (cc *CrowdControl) Commit(args *CommitArgs, response *CommitResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
+
+  if cc.recovering {
+    return ErrRecovering
+  }
 
   if cc.view != args.View {
     response.Success = false

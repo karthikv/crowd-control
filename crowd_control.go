@@ -57,11 +57,15 @@ const (
   // counting bloom filter configuration
   FILTER_CAPACITY = 256
   FILTER_NUM_HASHES = 6
+
+  // delay between recovery requests
+  RECOVERY_REQUEST_TIMEOUT = 1 * time.Second
 )
 
 
 var ErrViewChange = errors.New("aborted due to view change")
 var ErrCouldNotGetLease = errors.New("could not get lease")
+var ErrRecovering = errors.New("recovering")
 
 
 /* Represents a mutex along with its number of users. */
@@ -78,6 +82,8 @@ type CrowdControl struct {
   listener net.Listener
 
   dead bool  // used by testing framework to determine if this node is dead
+  deadCh chan bool
+
   rand *rand.Rand  // to generate random numbers
 
   // set of machines within the cluster
@@ -122,15 +128,23 @@ type CrowdControl struct {
 
   // mapping from keys to the time when request for fetch for kv pair from primary was made
   inflightKeys map[string]time.Time
+
+  // for recovering from hard crashes
+  recovering bool
+  lastRecoveryRequest time.Time
 }
 
 
 /* Creates a CrowdControl peer. `peers` is an array of peers within the
  * cluster, where each element is a string representing a socket. `me` is the
  * index of this peer. */
-func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
+func (cc *CrowdControl) Init(peers []string, me int, capacity uint64,
+    recovering bool) {
   source := rand.NewSource(time.Now().UnixNano())
   cc.rand = rand.New(source)
+
+  cc.dead = false
+  cc.deadCh = make(chan bool, 1)
 
   cc.peers = peers
   cc.numPeers = len(peers)
@@ -182,6 +196,8 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
   }
 
   cc.inflightKeys = make(map[string]time.Time)
+  cc.recovering = recovering
+  cc.lastRecoveryRequest = time.Time{}
 
   gob.Register(op_log.AddOperation{})
   gob.Register(op_log.RemoveOperation{})
@@ -208,7 +224,7 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
   cc.listener = listener
 
   go func() {
-    for {
+    for !cc.dead {
       conn, err := cc.listener.Accept()
 
       if err != nil {
@@ -218,5 +234,11 @@ func (cc *CrowdControl) Init(peers []string, me int, capacity uint64) {
 
       go rpcServer.ServeConn(conn)
     }
+  }()
+
+  go func() {
+    <-cc.deadCh
+    cc.dead = true
+    cc.listener.Close()
   }()
 }

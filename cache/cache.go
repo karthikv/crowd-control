@@ -84,6 +84,20 @@ func (cache *Cache) Delete(key string) {
 }
 
 
+/* Exports this cache to a map. */
+func (cache *Cache) Export() map[string]string {
+  pairs := make(map[string]string, len(cache.data))
+
+  for _, element := range cache.data {
+    // change value
+    kv := element.Value.(*KV)
+    pairs[kv.key] = kv.value
+  }
+
+  return pairs
+}
+
+
 /* Initializes a cache for use. capacity should be in bytes */
 func (cache *Cache) Init(capacity uint64) {
   cache.accessList = list.New()

@@ -54,6 +54,19 @@ func (rt *RPCTarget) live() {
 }
 
 
+/* Resets the RPC client. Used by the testing framework. */
+func (rt *RPCTarget) resetClient() {
+  rt.mutex.Lock()
+  defer rt.mutex.Unlock()
+
+  if rt.client != nil {
+    rt.client.Close()
+  }
+
+  rt.client = nil
+}
+
+
 /* Calls the RPC named `name` with the provided `args`, putting the response in
  * the given `reply`. */
 func (rt *RPCTarget) call(name string, args interface{}, reply *RPCReply) {

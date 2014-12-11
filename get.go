@@ -13,6 +13,10 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
 
+  if cc.recovering {
+    return ErrRecovering
+  }
+
   if cc.leaseUntil.Sub(time.Now()) <= 0 {
     // must get lease from primary
     leaseArgs := &RequestLeaseArgs{
@@ -181,6 +185,10 @@ func (cc *CrowdControl) SendKVPair(args *SendKVPairArgs,
     response *SendKVPairResponse) error {
   cc.mutex.Lock()
   defer cc.mutex.Unlock()
+
+  if cc.recovering {
+    return ErrRecovering
+  }
 
   if cc.view != args.View || cc.primary != args.Node {
     response.Status = SEND_KV_PAIR_REFUSED

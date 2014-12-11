@@ -34,7 +34,7 @@ func makeCluster(numPeers int, prefix string) ([]string, Cluster) {
   cluster := make(Cluster, numPeers)
   for i := 0; i < numPeers; i++ {
     cc := &CrowdControl{}
-    cc.Init(peers, i, CACHE_CAPACITY)
+    cc.Init(peers, i, CACHE_CAPACITY, false)
     cluster[i] = cc
   }
 
@@ -88,7 +88,11 @@ func (cluster Cluster) disableAll() {
 func (cluster Cluster) kill(node int) {
   cluster.disableFrom(node)
   cluster.disableTo(node)
-  cluster[node].dead = true
+
+  cluster[node].deadCh <- true
+  for _, cc := range cluster {
+    cc.rts[node].resetClient()
+  }
 }
 
 func (cluster Cluster) killAll() {
@@ -635,5 +639,66 @@ func TestGetThroughput(t *testing.T) {
   }
 
   log.Printf("total time %v, ops %v\n", end.Sub(start), totalOps)
+  cluster.killAll()
+}
+
+func TestRecovery(t *testing.T) {
+  numPeers := 3
+  peers, cluster := makeCluster(numPeers, "rec")
+
+  var client Client
+  client.Init("/tmp/rec-client.sock", peers)
+
+  // wait for leader election
+  time.Sleep(3 * ELECTION_TIMEOUT_MAX)
+
+  numPairs := 100
+  keys := make([]string, numPairs)
+  values := make([]string, numPairs)
+
+  log.Printf("Loading %v KV pairs...\n", numPairs)
+  // sets while node is alive
+  for i := 0; i < numPairs / 2; i++ {
+    keys[i] = generateString(16)
+    values[i] = generateString(32)
+
+    client.Set(keys[i], values[i])
+  }
+
+  node := (cluster[0].primary + 1) % numPeers
+  cluster.kill(node)
+
+  log.Printf("Killing %v\n", node)
+  time.Sleep(10 * time.Millisecond)
+
+  // sets while node is dead
+  for i := numPairs / 2; i < numPairs; i++ {
+    keys[i] = generateString(16)
+    values[i] = generateString(32)
+
+    client.Set(keys[i], values[i])
+  }
+
+  cc := &CrowdControl{}
+  cc.Init(peers, node, CACHE_CAPACITY, true)
+  cluster[node] = cc
+
+  cluster.enableTo(node)
+  cluster.enableFrom(node)
+
+  // wait for recovery
+  time.Sleep(5 * time.Second)
+
+  // node should have all kv pairs
+  for i := 0; i < numPairs; i++ {
+    response := &GetResponse{}
+    cluster[node].Get(&GetArgs{Key: keys[i]}, response)
+
+    if !(response.Exists && response.Value == values[i]) {
+      t.Fatalf("Couldn't get pair[%v] %v -> %v from recovered node.", i,
+        keys[i], values[i])
+    }
+  }
+
   cluster.killAll()
 }
