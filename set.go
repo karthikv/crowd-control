@@ -4,7 +4,6 @@ import (
   "time"
 
   "./op_log"
-  "log"
 )
 
 
@@ -281,8 +280,7 @@ func (cc *CrowdControl) Prep(args *PrepArgs, response *PrepResponse) error {
 
   startIndex := cc.nextOpNum - args.StartOpNum
   if args.Invalid || startIndex < 0 {
-    log.Printf("prep invalid!\n")
-    // TODO: must recover
+    cc.recovering = true
     response.Status = PREP_DELAYED
     return nil
   }

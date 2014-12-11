@@ -42,7 +42,6 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
     if reply.Success {
       leaseResponse := reply.Data.(*RequestLeaseResponse)
 
-      // TODO: case where filter is too full; need to recover?
       if leaseResponse.Status == LEASE_GRANTED {
         cc.leaseUntil = leaseResponse.Until
       } else if leaseResponse.Status == LEASE_REFUSED {
@@ -54,6 +53,12 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
     } else {
       return ErrCouldNotGetLease
     }
+  }
+
+  if cc.filters[cc.me].Size > FILTER_CAPACITY {
+    // missing a lot of data; must do a hard recovery
+    cc.recovering = true
+    return ErrRecovering
   }
 
   if cc.filters[cc.me].Contains([]byte(args.Key)) {
@@ -74,7 +79,6 @@ func (cc *CrowdControl) Get(args *GetArgs, response *GetResponse) error {
 
 
 func (cc *CrowdControl) getKVPairFromPrimary(key string) {
-  // TODO: garbage collect inflight keys
   cc.mutex.Lock()
   shouldRequestPair := false
 
